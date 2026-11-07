@@ -4,18 +4,34 @@ import asyncio
 import logging
 import re
 from collections.abc import Awaitable, Mapping
+from html import escape as escape_html
 from typing import Any
 
 from aiogram import F, Router
 from aiogram.enums import ChatAction, ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 
 from bot.faceit import FaceitClient, FaceitError, FaceitNotFound, FaceitRateLimit
 from bot.formatter import (
+    MENU_CANCEL_CALLBACK,
+    MENU_CANCEL_TEXT,
+    MENU_COMPARE_CALLBACK,
+    MENU_COMPARE_TEXT,
+    MENU_FIND_CALLBACK,
+    MENU_FIND_TEXT,
+    MENU_HELP_CALLBACK,
+    MENU_HELP_TEXT,
+    MENU_MAIN_CALLBACK,
+    build_cancel_keyboard,
     build_comparison_keyboard,
+    build_help_keyboard,
+    build_main_menu_keyboard,
     build_player_keyboard,
+    build_start_keyboard,
     format_player_comparison,
     format_player_stats,
 )
@@ -40,35 +56,91 @@ logger = logging.getLogger(__name__)
 
 router = Router(name="main")
 
+
+class CompareFlow(StatesGroup):
+    """Состояния пошагового сравнения двух игроков."""
+
+    waiting_first = State()
+    waiting_second = State()
+
+
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 TRAILING_PUNCTUATION = ".,;:!?)]}>\"'"
 REFRESH_CALLBACK_PREFIX = "refresh:"
 REFRESH_COMPARE_CALLBACK_PREFIX = "refresh_compare:"
 COMPARE_SEPARATORS = {"vs", "vs.", "и", "and", "&", "против"}
+COMPARE_LEFT_STEAM64_KEY = "compare_left_steam64"
+CANCEL_TEXTS = {MENU_CANCEL_TEXT.casefold(), "отмена", "/cancel"}
 
 START_MESSAGE = (
     "<b>Привет!</b> 👋\n\n"
-    "Отправь ссылку на Steam-профиль — покажу статистику игрока "
-    "на <b>Faceit</b> по CS2.\n\n"
-    "Хочешь сравнить двух игроков? Отправь две ссылки одним сообщением "
-    "или используй <code>/compare url1 url2</code>.\n\n"
+    "Я показываю статистику CS2 на <b>Faceit</b>.\n\n"
+    "Выбери действие кнопками ниже или просто отправь ссылку "
+    "на Steam-профиль.\n\n"
     "Например: <code>https://steamcommunity.com/id/username</code>"
 )
 
+MENU_HINT_MESSAGE = "Панель управления всегда внизу 👇"
+
 HELP_MESSAGE = (
     "<b>Как пользоваться ботом</b>\n\n"
-    "1. Отправь ссылку на Steam-профиль, например:\n"
+    "1. Нажми «🔍 Найти игрока» или отправь ссылку на Steam-профиль, "
+    "например:\n"
     "<code>https://steamcommunity.com/id/username</code>\n"
     "2. Бот найдёт игрока на Faceit и покажет статистику CS2.\n\n"
-    "Для сравнения двух игроков отправь две ссылки одним сообщением "
-    "или используй:\n"
+    "Для сравнения нажми «⚔️ Сравнить игроков» — бот попросит ссылки "
+    "по очереди. Можно также отправить две ссылки одним сообщением "
+    "или использовать:\n"
     "<code>/compare url1 url2</code>\n\n"
-    "Под сообщением есть кнопки для перехода в профиль Faceit "
-    "и обновления статистики.\n\n"
+    "Отменить пошаговый ввод можно кнопкой «Отмена» или командой "
+    "<code>/cancel</code>.\n\n"
     "<b>Команды</b>\n"
-    "/start — начать работу\n"
+    "/start — показать главное меню\n"
     "/help — показать эту справку\n"
-    "/compare url1 url2 — сравнить двух игроков"
+    "/compare url1 url2 — сравнить двух игроков\n"
+    "/cancel — отменить пошаговый ввод"
+)
+
+FIND_PROMPT_MESSAGE = (
+    "<b>🔍 Поиск игрока</b>\n\n"
+    "Отправь ссылку на Steam-профиль, SteamID64 или vanity-имя.\n\n"
+    "Например: <code>https://steamcommunity.com/id/username</code>"
+)
+
+COMPARE_FIRST_PROMPT_MESSAGE = (
+    "<b>⚔️ Сравнение игроков</b>\n\n"
+    "Шаг 1 из 2. Отправь ссылку на <b>первого</b> игрока.\n"
+    "Можно также отправить сразу две ссылки одним сообщением."
+)
+
+COMPARE_SECOND_PROMPT_MESSAGE = (
+    "<b>⚔️ Сравнение игроков</b>\n\n"
+    "Первый игрок: <b>{nickname}</b>\n"
+    "Шаг 2 из 2. Теперь отправь ссылку на <b>второго</b> игрока."
+)
+
+CANCELLED_MESSAGE = (
+    "<b>Действие отменено.</b>\n\n"
+    "Выбери действие на панели ниже или начни заново."
+)
+
+FLOW_NO_LINK_MESSAGE = (
+    "Не вижу ссылки. Отправь ссылку на Steam-профиль "
+    "или нажми «Отмена»."
+)
+
+FLOW_ONE_LINK_MESSAGE = (
+    "Для этого шага нужна одна ссылка. "
+    "Отправь её или нажми «Отмена»."
+)
+
+FLOW_INVALID_STEAM_MESSAGE = (
+    "Не удалось получить SteamID64. "
+    "Проверь ссылку и попробуй ещё раз."
+)
+
+FLOW_EXPIRED_MESSAGE = (
+    "Сессия сравнения устарела. Начни сравнение заново."
 )
 
 NO_LINK_MESSAGE = (
@@ -185,6 +257,37 @@ async def _send_typing(message: Message) -> None:
         await message.bot.send_chat_action(
             chat_id=message.chat.id,
             action=ChatAction.TYPING,
+        )
+
+
+def _is_cancel_text(text: str) -> bool:
+    """Проверяет, что пользователь просит отменить пошаговый сценарий."""
+    return text.strip().casefold() in CANCEL_TEXTS
+
+
+async def _edit_inline_or_answer(
+    message: Message,
+    text: str,
+    *,
+    reply_markup: InlineKeyboardMarkup | None,
+) -> None:
+    """Редактирует сообщение с inline-клавиатурой или отправляет новое."""
+    try:
+        await message.edit_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except TelegramBadRequest as exc:
+        if "message is not modified" in str(exc):
+            return
+        logger.warning("Не удалось отредактировать меню: %s", exc)
+        await message.answer(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
         )
 
 
@@ -506,21 +609,14 @@ async def _build_comparison_message(
     return text, keyboard
 
 
-async def _handle_compare_request(
+async def _send_comparison_result(
     message: Message,
-    inputs: list[str],
+    left_steam64: str,
+    right_steam64: str,
     faceit_client: FaceitClient,
 ) -> None:
-    """Валидирует ввод и отправляет сравнение двух игроков."""
+    """Загружает двух игроков и отправляет готовое сравнение."""
     await _send_typing(message)
-
-    resolved = await _resolve_compare_inputs(inputs)
-    if isinstance(resolved, str):
-        await message.answer(resolved)
-        return
-
-    left_steam64, right_steam64 = resolved
-
     try:
         text, keyboard = await _build_comparison_message(
             left_steam64,
@@ -541,6 +637,158 @@ async def _handle_compare_request(
         reply_markup=keyboard,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
+    )
+
+
+async def _handle_compare_request(
+    message: Message,
+    inputs: list[str],
+    faceit_client: FaceitClient,
+) -> None:
+    """Валидирует ввод и отправляет сравнение двух игроков."""
+    resolved = await _resolve_compare_inputs(inputs)
+    if isinstance(resolved, str):
+        await message.answer(resolved)
+        return
+
+    left_steam64, right_steam64 = resolved
+    await _send_comparison_result(
+        message,
+        left_steam64,
+        right_steam64,
+        faceit_client,
+    )
+
+
+async def _start_compare_flow(
+    message: Message,
+    state: FSMContext,
+    faceit_client: FaceitClient | None,
+) -> None:
+    """Запускает пошаговый сценарий сравнения."""
+    if faceit_client is None:
+        await message.answer(FACEIT_NOT_CONFIGURED_MESSAGE)
+        return
+
+    await state.clear()
+    await state.set_state(CompareFlow.waiting_first)
+    await message.answer(
+        COMPARE_FIRST_PROMPT_MESSAGE,
+        reply_markup=build_cancel_keyboard(),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+async def _cancel_compare_flow(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    """Сбрасывает состояние и показывает экран отмены."""
+    await state.clear()
+    await message.answer(
+        CANCELLED_MESSAGE,
+        reply_markup=build_start_keyboard(),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+async def _handle_compare_first_input(
+    message: Message,
+    state: FSMContext,
+    faceit_client: FaceitClient,
+) -> None:
+    """Обрабатывает первый шаг пошагового сравнения."""
+    inputs = _parse_compare_inputs(message.text or "")
+    if not inputs:
+        await message.answer(FLOW_NO_LINK_MESSAGE)
+        return
+    if len(inputs) > 2:
+        await message.answer(COMPARE_TOO_MANY_LINKS_MESSAGE)
+        return
+    if len(inputs) == 2:
+        await state.clear()
+        await _handle_compare_request(message, inputs, faceit_client)
+        return
+
+    steam64 = await resolve_steam_id(inputs[0])
+    if steam64 is None:
+        await message.answer(FLOW_INVALID_STEAM_MESSAGE)
+        return
+
+    try:
+        player = await faceit_client.get_player_by_steam_id(steam64)
+    except FaceitError as exc:
+        logger.warning("Сравнение, ошибка первого игрока: %s", exc)
+        await message.answer(_error_message(exc))
+        return
+    except Exception:
+        logger.exception("Неожиданная ошибка на первом шаге сравнения")
+        await message.answer(FACEIT_ERROR_MESSAGE)
+        return
+
+    if player is None:
+        await message.answer(COMPARE_FIRST_NOT_FOUND_MESSAGE)
+        return
+
+    nickname = str(player.get("nickname") or steam64)
+    await state.update_data(
+        **{COMPARE_LEFT_STEAM64_KEY: steam64}
+    )
+    await state.set_state(CompareFlow.waiting_second)
+    await message.answer(
+        COMPARE_SECOND_PROMPT_MESSAGE.format(
+            nickname=escape_html(nickname),
+        ),
+        reply_markup=build_cancel_keyboard(),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+async def _handle_compare_second_input(
+    message: Message,
+    state: FSMContext,
+    faceit_client: FaceitClient,
+) -> None:
+    """Обрабатывает второй шаг пошагового сравнения."""
+    data = await state.get_data()
+    left_steam64 = data.get(COMPARE_LEFT_STEAM64_KEY)
+    if not isinstance(left_steam64, str) or not STEAM_ID64_RE.fullmatch(
+        left_steam64
+    ):
+        await state.clear()
+        await message.answer(
+            FLOW_EXPIRED_MESSAGE,
+            reply_markup=build_start_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    inputs = _parse_compare_inputs(message.text or "")
+    if not inputs:
+        await message.answer(FLOW_NO_LINK_MESSAGE)
+        return
+    if len(inputs) != 1:
+        await message.answer(FLOW_ONE_LINK_MESSAGE)
+        return
+
+    right_steam64 = await resolve_steam_id(inputs[0])
+    if right_steam64 is None:
+        await message.answer(FLOW_INVALID_STEAM_MESSAGE)
+        return
+
+    if right_steam64 == left_steam64:
+        await message.answer(COMPARE_SAME_PLAYER_MESSAGE)
+        return
+
+    await state.clear()
+    await _send_comparison_result(
+        message,
+        left_steam64,
+        right_steam64,
+        faceit_client,
     )
 
 
@@ -566,24 +814,64 @@ def _build_message(
 
 
 @router.message(Command("start"))
-async def handle_start(message: Message) -> None:
-    """Обрабатывает команду /start."""
-    await message.answer(START_MESSAGE)
+async def handle_start(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    """Обрабатывает команду /start и показывает главное меню."""
+    await state.clear()
+    await message.answer(
+        START_MESSAGE,
+        reply_markup=build_start_keyboard(),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+    await message.answer(
+        MENU_HINT_MESSAGE,
+        reply_markup=build_main_menu_keyboard(),
+    )
 
 
 @router.message(Command("help"))
-async def handle_help(message: Message) -> None:
+async def handle_help(
+    message: Message,
+    state: FSMContext,
+) -> None:
     """Обрабатывает команду /help."""
-    await message.answer(HELP_MESSAGE)
+    await state.clear()
+    await message.answer(
+        HELP_MESSAGE,
+        reply_markup=build_help_keyboard(),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+@router.message(Command("cancel"))
+async def handle_cancel(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    """Отменяет пошаговый сценарий и показывает меню."""
+    await state.clear()
+    await message.answer(
+        CANCELLED_MESSAGE,
+        reply_markup=build_start_keyboard(),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
 
 
 @router.message(Command("compare"))
 async def handle_compare(
     message: Message,
     command: CommandObject,
+    state: FSMContext,
     faceit_client: FaceitClient | None = None,
 ) -> None:
     """Обрабатывает команду /compare с двумя Steam-идентификаторами."""
+    await state.clear()
+
     if faceit_client is None:
         await message.answer(FACEIT_NOT_CONFIGURED_MESSAGE)
         return
@@ -600,6 +888,87 @@ async def handle_compare(
         return
 
     await _handle_compare_request(message, inputs, faceit_client)
+
+
+@router.message(F.text == MENU_FIND_TEXT)
+async def handle_menu_find_text(
+    message: Message,
+    state: FSMContext,
+    faceit_client: FaceitClient | None = None,
+) -> None:
+    """Обрабатывает кнопку Reply-меню «Найти игрока»."""
+    await state.clear()
+    if faceit_client is None:
+        await message.answer(FACEIT_NOT_CONFIGURED_MESSAGE)
+        return
+
+    await message.answer(
+        FIND_PROMPT_MESSAGE,
+        reply_markup=build_cancel_keyboard(),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+@router.message(F.text == MENU_COMPARE_TEXT)
+async def handle_menu_compare_text(
+    message: Message,
+    state: FSMContext,
+    faceit_client: FaceitClient | None = None,
+) -> None:
+    """Обрабатывает кнопку Reply-меню «Сравнить игроков»."""
+    await _start_compare_flow(message, state, faceit_client)
+
+
+@router.message(F.text == MENU_HELP_TEXT)
+async def handle_menu_help_text(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    """Обрабатывает кнопку Reply-меню «Помощь»."""
+    await state.clear()
+    await message.answer(
+        HELP_MESSAGE,
+        reply_markup=build_help_keyboard(),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+@router.message(CompareFlow.waiting_first, F.text)
+async def handle_compare_first_step(
+    message: Message,
+    state: FSMContext,
+    faceit_client: FaceitClient | None = None,
+) -> None:
+    """Принимает первого игрока в пошаговом сравнении."""
+    if _is_cancel_text(message.text or ""):
+        await _cancel_compare_flow(message, state)
+        return
+
+    if faceit_client is None:
+        await message.answer(FACEIT_NOT_CONFIGURED_MESSAGE)
+        return
+
+    await _handle_compare_first_input(message, state, faceit_client)
+
+
+@router.message(CompareFlow.waiting_second, F.text)
+async def handle_compare_second_step(
+    message: Message,
+    state: FSMContext,
+    faceit_client: FaceitClient | None = None,
+) -> None:
+    """Принимает второго игрока и отправляет сравнение."""
+    if _is_cancel_text(message.text or ""):
+        await _cancel_compare_flow(message, state)
+        return
+
+    if faceit_client is None:
+        await message.answer(FACEIT_NOT_CONFIGURED_MESSAGE)
+        return
+
+    await _handle_compare_second_input(message, state, faceit_client)
 
 
 @router.message(F.text)
@@ -654,6 +1023,108 @@ async def handle_link(
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
+
+
+@router.callback_query(F.data == MENU_FIND_CALLBACK)
+async def handle_menu_find(
+    query: CallbackQuery,
+    state: FSMContext,
+    faceit_client: FaceitClient | None = None,
+) -> None:
+    """Открывает экран поиска игрока из inline-меню."""
+    if faceit_client is None:
+        await query.answer(
+            FACEIT_NOT_CONFIGURED_MESSAGE,
+            show_alert=True,
+        )
+        return
+
+    await state.clear()
+    await query.answer()
+
+    if isinstance(query.message, Message):
+        await _edit_inline_or_answer(
+            query.message,
+            FIND_PROMPT_MESSAGE,
+            reply_markup=build_cancel_keyboard(),
+        )
+
+
+@router.callback_query(F.data == MENU_COMPARE_CALLBACK)
+async def handle_menu_compare(
+    query: CallbackQuery,
+    state: FSMContext,
+    faceit_client: FaceitClient | None = None,
+) -> None:
+    """Запускает пошаговое сравнение из inline-меню."""
+    if faceit_client is None:
+        await query.answer(
+            FACEIT_NOT_CONFIGURED_MESSAGE,
+            show_alert=True,
+        )
+        return
+
+    await state.clear()
+    await state.set_state(CompareFlow.waiting_first)
+    await query.answer()
+
+    if isinstance(query.message, Message):
+        await _edit_inline_or_answer(
+            query.message,
+            COMPARE_FIRST_PROMPT_MESSAGE,
+            reply_markup=build_cancel_keyboard(),
+        )
+
+
+@router.callback_query(F.data == MENU_HELP_CALLBACK)
+async def handle_menu_help(
+    query: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    """Открывает справку из inline-меню."""
+    await state.clear()
+    await query.answer()
+
+    if isinstance(query.message, Message):
+        await _edit_inline_or_answer(
+            query.message,
+            HELP_MESSAGE,
+            reply_markup=build_help_keyboard(),
+        )
+
+
+@router.callback_query(F.data == MENU_CANCEL_CALLBACK)
+async def handle_menu_cancel(
+    query: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    """Отменяет пошаговый сценарий по inline-кнопке."""
+    await state.clear()
+    await query.answer("Отменено")
+
+    if isinstance(query.message, Message):
+        await _edit_inline_or_answer(
+            query.message,
+            CANCELLED_MESSAGE,
+            reply_markup=build_start_keyboard(),
+        )
+
+
+@router.callback_query(F.data == MENU_MAIN_CALLBACK)
+async def handle_menu_main(
+    query: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    """Возвращает пользователя на стартовый экран."""
+    await state.clear()
+    await query.answer()
+
+    if isinstance(query.message, Message):
+        await _edit_inline_or_answer(
+            query.message,
+            START_MESSAGE,
+            reply_markup=build_start_keyboard(),
+        )
 
 
 @router.callback_query(F.data.startswith(REFRESH_CALLBACK_PREFIX))

@@ -4,10 +4,22 @@ from datetime import datetime
 
 from bot.formatter import (
     MAX_MESSAGE_LENGTH,
+    MENU_CANCEL_CALLBACK,
+    MENU_COMPARE_CALLBACK,
+    MENU_COMPARE_TEXT,
+    MENU_FIND_CALLBACK,
+    MENU_FIND_TEXT,
+    MENU_HELP_CALLBACK,
+    MENU_HELP_TEXT,
+    MENU_MAIN_CALLBACK,
     _format_map_line,
     _limit_message,
+    build_cancel_keyboard,
     build_comparison_keyboard,
+    build_help_keyboard,
+    build_main_menu_keyboard,
     build_player_keyboard,
+    build_start_keyboard,
     format_player_comparison,
     format_player_stats,
 )
@@ -492,3 +504,39 @@ def test_format_player_comparison_escapes_html() -> None:
     assert "<b>Alpha</b>" not in text
     assert len(text) <= MAX_MESSAGE_LENGTH
 
+
+
+def test_build_main_menu_keyboard_is_persistent_and_has_actions() -> None:
+    keyboard = build_main_menu_keyboard()
+
+    assert keyboard.is_persistent is True
+    assert keyboard.resize_keyboard is True
+    assert [
+        [button.text for button in row]
+        for row in keyboard.keyboard
+    ] == [
+        [MENU_FIND_TEXT, MENU_COMPARE_TEXT],
+        [MENU_HELP_TEXT],
+    ]
+
+
+def test_build_start_keyboard_has_quick_actions() -> None:
+    keyboard = build_start_keyboard()
+
+    assert keyboard.inline_keyboard[0][0].text == MENU_FIND_TEXT
+    assert keyboard.inline_keyboard[0][0].callback_data == MENU_FIND_CALLBACK
+    assert keyboard.inline_keyboard[0][1].text == MENU_COMPARE_TEXT
+    assert (
+        keyboard.inline_keyboard[0][1].callback_data
+        == MENU_COMPARE_CALLBACK
+    )
+    assert keyboard.inline_keyboard[1][0].text == MENU_HELP_TEXT
+    assert keyboard.inline_keyboard[1][0].callback_data == MENU_HELP_CALLBACK
+
+
+def test_build_cancel_and_help_keyboards() -> None:
+    cancel = build_cancel_keyboard()
+    help_keyboard = build_help_keyboard()
+
+    assert cancel.inline_keyboard[0][0].callback_data == MENU_CANCEL_CALLBACK
+    assert help_keyboard.inline_keyboard[0][0].callback_data == MENU_MAIN_CALLBACK

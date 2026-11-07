@@ -8,15 +8,33 @@ import pytest
 import pytest_asyncio
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.base import StorageKey
 from aiogram.methods import (
     EditMessageText,
     AnswerCallbackQuery,
     SendMessage,
     TelegramMethod,
 )
-from aiogram.types import CallbackQuery, Chat, Message, Update, User
+from aiogram.types import (
+    CallbackQuery,
+    Chat,
+    InlineKeyboardMarkup,
+    Message,
+    ReplyKeyboardMarkup,
+    Update,
+    User,
+)
 
 from bot import handlers
+from bot.formatter import (
+    MENU_CANCEL_CALLBACK,
+    MENU_COMPARE_CALLBACK,
+    MENU_COMPARE_TEXT,
+    MENU_FIND_CALLBACK,
+    MENU_FIND_TEXT,
+    MENU_HELP_TEXT,
+)
 from bot.steam import SteamStats
 from bot.stats import RECENT_MATCHES_FETCH_LIMIT
 
@@ -363,6 +381,39 @@ def dispatcher() -> Dispatcher:
     return dispatcher
 
 
+def fsm_key(bot: Bot) -> StorageKey:
+    """Возвращает ключ FSM для тестового чата и пользователя."""
+    return StorageKey(
+        bot_id=bot.id,
+        chat_id=CHAT.id,
+        user_id=USER.id,
+    )
+
+
+async def clear_fsm(dispatcher: Dispatcher, bot: Bot) -> None:
+    """Полностью сбрасывает состояние и данные FSM."""
+    key = fsm_key(bot)
+    await dispatcher.storage.set_state(key, None)
+    await dispatcher.storage.set_data(key, {})
+
+
+async def get_fsm_state(dispatcher: Dispatcher, bot: Bot) -> str | None:
+    """Возвращает текущее состояние FSM."""
+    context = FSMContext(dispatcher.storage, fsm_key(bot))
+    return await context.get_state()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def reset_fsm(
+    dispatcher: Dispatcher,
+    bot: Bot,
+) -> AsyncGenerator[None, None]:
+    """Изолирует FSM между интеграционными тестами."""
+    await clear_fsm(dispatcher, bot)
+    yield
+    await clear_fsm(dispatcher, bot)
+
+
 def make_message(text: str, message_id: int = 1) -> Message:
     return Message(
         message_id=message_id,
@@ -370,6 +421,16 @@ def make_message(text: str, message_id: int = 1) -> Message:
         chat=CHAT,
         from_user=USER,
         text=text,
+    )
+
+
+def make_callback(data: str, message_id: int = 2) -> CallbackQuery:
+    return CallbackQuery(
+        id="callback-1",
+        from_user=USER,
+        chat_instance="chat-instance",
+        data=data,
+        message=make_message("меню", message_id=message_id),
     )
 
 
@@ -943,3 +1004,333 @@ async def test_handle_compare_refresh_clears_cache_and_edits_message(
         edits[0].reply_markup.inline_keyboard[1][0].callback_data
         == f"refresh_compare:{STEAM_ID64}:{STEAM_ID64_TWO}"
     )
+
+
+@pytest.mark.asyncio
+async def test_handle_start_shows_start_and_persistent_menu(
+    bot: Bot,
+    dispatcher: Dispatcher,
+) -> None:
+    setup_dispatcher(dispatcher, FakeFaceitClient())
+
+    await dispatcher.feed_update(
+        bot,
+        Update(update_id=1, message=make_message("/start")),
+    )
+
+    messages = send_messages(bot)
+    assert len(messages) == 2
+    start_message, menu_message = messages
+
+    assert "Привет" in (start_message.text or "")
+    start_keyboard = start_message.reply_markup
+    assert isinstance(start_keyboard, InlineKeyboardMarkup)
+    assert start_keyboard.inline_keyboard[0][0].callback_data == (
+        MENU_FIND_CALLBACK
+    )
+    assert start_keyboard.inline_keyboard[0][1].callback_data == (
+        MENU_COMPARE_CALLBACK
+    )
+
+    menu_keyboard = menu_message.reply_markup
+    assert isinstance(menu_keyboard, ReplyKeyboardMarkup)
+    assert menu_keyboard.is_persistent is True
+    assert menu_keyboard.resize_keyboard is True
+    assert [
+        [button.text for button in row]
+        for row in menu_keyboard.keyboard
+    ] == [
+        [MENU_FIND_TEXT, MENU_COMPARE_TEXT],
+        [MENU_HELP_TEXT],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_menu_find_text_prompts_for_link(
+    bot: Bot,
+    dispatcher: Dispatcher,
+) -> None:
+    setup_dispatcher(dispatcher, FakeFaceitClient())
+
+    await dispatcher.feed_update(
+        bot,
+        Update(update_id=1, message=make_message(MENU_FIND_TEXT)),
+    )
+
+    messages = send_messages(bot)
+    assert len(messages) == 1
+    assert "Поиск игрока" in (messages[0].text or "")
+    assert messages[0].reply_markup is not None
+    assert (
+        messages[0].reply_markup.inline_keyboard[0][0].callback_data
+        == MENU_CANCEL_CALLBACK
+    )
+
+
+@pytest.mark.asyncio
+async def test_guided_compare_flow_from_reply_menu(
+    bot: Bot,
+    dispatcher: Dispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    faceit_client = make_compare_client(
+        players_by_steam={
+            STEAM_ID64: PLAYER,
+            STEAM_ID64_TWO: PLAYER_TWO,
+        },
+        lifetime_by_player={
+            PLAYER_ID: LIFETIME,
+            PLAYER_TWO_ID: LIFETIME_TWO,
+        },
+        recent_by_player={
+            PLAYER_ID: RECENT,
+            PLAYER_TWO_ID: RECENT_TWO,
+        },
+    )
+    setup_dispatcher(dispatcher, faceit_client)
+    patch_compare_dependencies(
+        monkeypatch,
+        steam_by_steam={
+            STEAM_ID64: SteamStats(cs2_hours=100, vac_banned=False),
+            STEAM_ID64_TWO: SteamStats(cs2_hours=200, vac_banned=False),
+        },
+    )
+
+    await dispatcher.feed_update(
+        bot,
+        Update(update_id=1, message=make_message(MENU_COMPARE_TEXT)),
+    )
+
+    first_prompt = send_messages(bot)[0]
+    assert "Шаг 1 из 2" in (first_prompt.text or "")
+    assert (
+        first_prompt.reply_markup.inline_keyboard[0][0].callback_data
+        == MENU_CANCEL_CALLBACK
+    )
+    assert await get_fsm_state(dispatcher, bot) == (
+        handlers.CompareFlow.waiting_first.state
+    )
+
+    bot.session.requests.clear()
+    await dispatcher.feed_update(
+        bot,
+        Update(update_id=2, message=make_message(URL_ONE)),
+    )
+
+    second_prompt = send_messages(bot)[0]
+    assert "Шаг 2 из 2" in (second_prompt.text or "")
+    assert "TestPlayer" in (second_prompt.text or "")
+    assert await get_fsm_state(dispatcher, bot) == (
+        handlers.CompareFlow.waiting_second.state
+    )
+
+    bot.session.requests.clear()
+    await dispatcher.feed_update(
+        bot,
+        Update(update_id=3, message=make_message(URL_TWO)),
+    )
+
+    comparison_messages = send_messages(bot)
+    assert len(comparison_messages) == 1
+    comparison = comparison_messages[0]
+    assert "Сравнение игроков" in (comparison.text or "")
+    assert "TestPlayer" in (comparison.text or "")
+    assert "RivalPlayer" in (comparison.text or "")
+    assert comparison.reply_markup is not None
+    assert (
+        comparison.reply_markup.inline_keyboard[1][0].callback_data
+        == f"refresh_compare:{STEAM_ID64}:{STEAM_ID64_TWO}"
+    )
+    assert await get_fsm_state(dispatcher, bot) is None
+
+
+@pytest.mark.asyncio
+async def test_guided_compare_accepts_two_links_at_first_step(
+    bot: Bot,
+    dispatcher: Dispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    faceit_client = make_compare_client(
+        players_by_steam={
+            STEAM_ID64: PLAYER,
+            STEAM_ID64_TWO: PLAYER_TWO,
+        },
+        lifetime_by_player={
+            PLAYER_ID: LIFETIME,
+            PLAYER_TWO_ID: LIFETIME_TWO,
+        },
+        recent_by_player={
+            PLAYER_ID: RECENT,
+            PLAYER_TWO_ID: RECENT_TWO,
+        },
+    )
+    setup_dispatcher(dispatcher, faceit_client)
+    patch_compare_dependencies(monkeypatch)
+
+    await dispatcher.feed_update(
+        bot,
+        Update(update_id=1, message=make_message(MENU_COMPARE_TEXT)),
+    )
+    bot.session.requests.clear()
+
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=2,
+            message=make_message(f"{URL_ONE} {URL_TWO}"),
+        ),
+    )
+
+    messages = send_messages(bot)
+    assert len(messages) == 1
+    assert "Сравнение игроков" in (messages[0].text or "")
+    assert await get_fsm_state(dispatcher, bot) is None
+
+
+@pytest.mark.asyncio
+async def test_compare_cancel_callback_clears_state(
+    bot: Bot,
+    dispatcher: Dispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_dispatcher(dispatcher, FakeFaceitClient())
+    patch_compare_dependencies(monkeypatch)
+
+    await dispatcher.feed_update(
+        bot,
+        Update(update_id=1, message=make_message(MENU_COMPARE_TEXT)),
+    )
+    assert await get_fsm_state(dispatcher, bot) == (
+        handlers.CompareFlow.waiting_first.state
+    )
+
+    bot.session.requests.clear()
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=2,
+            callback_query=make_callback(MENU_CANCEL_CALLBACK),
+        ),
+    )
+
+    assert await get_fsm_state(dispatcher, bot) is None
+
+    answers = [
+        method
+        for method in bot.session.requests
+        if isinstance(method, AnswerCallbackQuery)
+    ]
+    assert answers[0].text == "Отменено"
+
+    edits = [
+        method
+        for method in bot.session.requests
+        if isinstance(method, EditMessageText)
+    ]
+    assert len(edits) == 1
+    assert edits[0].text == handlers.CANCELLED_MESSAGE
+    assert edits[0].reply_markup is not None
+    assert (
+        edits[0].reply_markup.inline_keyboard[0][0].callback_data
+        == MENU_FIND_CALLBACK
+    )
+
+
+@pytest.mark.asyncio
+async def test_menu_compare_callback_starts_guided_flow(
+    bot: Bot,
+    dispatcher: Dispatcher,
+) -> None:
+    setup_dispatcher(dispatcher, FakeFaceitClient())
+
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=1,
+            callback_query=make_callback(MENU_COMPARE_CALLBACK),
+        ),
+    )
+
+    assert await get_fsm_state(dispatcher, bot) == (
+        handlers.CompareFlow.waiting_first.state
+    )
+
+    edits = [
+        method
+        for method in bot.session.requests
+        if isinstance(method, EditMessageText)
+    ]
+    assert len(edits) == 1
+    assert "Шаг 1 из 2" in (edits[0].text or "")
+    assert edits[0].reply_markup is not None
+    assert (
+        edits[0].reply_markup.inline_keyboard[0][0].callback_data
+        == MENU_CANCEL_CALLBACK
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_command_clears_guided_flow(
+    bot: Bot,
+    dispatcher: Dispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_dispatcher(dispatcher, FakeFaceitClient())
+    patch_compare_dependencies(monkeypatch)
+
+    await dispatcher.feed_update(
+        bot,
+        Update(update_id=1, message=make_message(MENU_COMPARE_TEXT)),
+    )
+    bot.session.requests.clear()
+
+    await dispatcher.feed_update(
+        bot,
+        Update(update_id=2, message=make_message("/cancel")),
+    )
+
+    assert await get_fsm_state(dispatcher, bot) is None
+    messages = send_messages(bot)
+    assert len(messages) == 1
+    assert messages[0].text == handlers.CANCELLED_MESSAGE
+    assert messages[0].reply_markup is not None
+    assert (
+        messages[0].reply_markup.inline_keyboard[0][0].callback_data
+        == MENU_FIND_CALLBACK
+    )
+
+
+@pytest.mark.asyncio
+async def test_find_menu_then_single_link_shows_stats(
+    bot: Bot,
+    dispatcher: Dispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_dispatcher(dispatcher, FakeFaceitClient())
+    patch_steam(
+        monkeypatch,
+        SteamStats(cs2_hours=100, vac_banned=False),
+    )
+
+    async def fake_resolve(value: str) -> str:
+        assert value == URL_ONE
+        return STEAM_ID64
+
+    monkeypatch.setattr(handlers, "resolve_steam_id", fake_resolve)
+
+    await dispatcher.feed_update(
+        bot,
+        Update(update_id=1, message=make_message(MENU_FIND_TEXT)),
+    )
+    bot.session.requests.clear()
+
+    await dispatcher.feed_update(
+        bot,
+        Update(update_id=2, message=make_message(URL_ONE)),
+    )
+
+    messages = send_messages(bot)
+    assert len(messages) == 1
+    assert "TestPlayer" in (messages[0].text or "")
+    assert "Общая статистика" in (messages[0].text or "")
+    assert await get_fsm_state(dispatcher, bot) is None

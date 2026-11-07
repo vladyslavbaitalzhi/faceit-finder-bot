@@ -4,7 +4,12 @@ import html
 from collections.abc import Callable
 from datetime import datetime
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 
 from bot.stats import (
     MIN_MAP_MATCHES,
@@ -20,6 +25,18 @@ MAX_MESSAGE_LENGTH = 4096
 MAX_NICKNAME_LENGTH = 64
 MAX_MAP_NAME_LENGTH = 48
 MAX_URL_LENGTH = 512
+
+MENU_FIND_TEXT = "🔍 Найти игрока"
+MENU_COMPARE_TEXT = "⚔️ Сравнить игроков"
+MENU_HELP_TEXT = "ℹ️ Помощь"
+MENU_CANCEL_TEXT = "✖️ Отмена"
+MENU_MAIN_TEXT = "⬅️ В главное меню"
+
+MENU_FIND_CALLBACK = "menu:find"
+MENU_COMPARE_CALLBACK = "menu:compare"
+MENU_HELP_CALLBACK = "menu:help"
+MENU_CANCEL_CALLBACK = "menu:cancel"
+MENU_MAIN_CALLBACK = "menu:main"
 
 
 def _truncate(value: str, max_length: int) -> str:
@@ -684,6 +701,76 @@ def build_player_keyboard(
                 InlineKeyboardButton(
                     text="Обновить",
                     callback_data=refresh_callback_data,
+                )
+            ],
+        ]
+    )
+
+
+def build_main_menu_keyboard() -> ReplyKeyboardMarkup:
+    """Создаёт постоянное Reply-меню под полем ввода."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text=MENU_FIND_TEXT),
+                KeyboardButton(text=MENU_COMPARE_TEXT),
+            ],
+            [
+                KeyboardButton(text=MENU_HELP_TEXT),
+            ],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Выбери действие",
+    )
+
+
+def build_start_keyboard() -> InlineKeyboardMarkup:
+    """Создаёт inline-кнопки быстрого доступа для стартового экрана."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=MENU_FIND_TEXT,
+                    callback_data=MENU_FIND_CALLBACK,
+                ),
+                InlineKeyboardButton(
+                    text=MENU_COMPARE_TEXT,
+                    callback_data=MENU_COMPARE_CALLBACK,
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=MENU_HELP_TEXT,
+                    callback_data=MENU_HELP_CALLBACK,
+                ),
+            ],
+        ]
+    )
+
+
+def build_cancel_keyboard() -> InlineKeyboardMarkup:
+    """Создаёт клавиатуру отмены текущего пошагового сценария."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=MENU_CANCEL_TEXT,
+                    callback_data=MENU_CANCEL_CALLBACK,
+                )
+            ],
+        ]
+    )
+
+
+def build_help_keyboard() -> InlineKeyboardMarkup:
+    """Создаёт клавиатуру возврата в главное меню с экрана помощи."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=MENU_MAIN_TEXT,
+                    callback_data=MENU_MAIN_CALLBACK,
                 )
             ],
         ]
