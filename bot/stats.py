@@ -5,8 +5,10 @@ import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote
+
+from pydantic import BaseModel, ConfigDict
 
 from bot.steam import SteamStats
 
@@ -209,6 +211,50 @@ class PlayerStats:
     ranking: PlayerRanking | None = None
     last_matches: tuple[MatchSummary, ...] = ()
     steam: SteamStats | None = None
+
+
+ComparisonMetricKey = Literal[
+    "elo",
+    "winrate",
+    "kd",
+    "hs",
+    "adr",
+    "streak",
+    "hours",
+]
+
+
+class ComparisonMetric(BaseModel):
+    """Одна метрика в сравнительной таблице двух игроков."""
+
+    model_config = ConfigDict(frozen=True)
+
+    key: ComparisonMetricKey
+    label: str
+    left: float | None = None
+    right: float | None = None
+    delta: float | None = None
+    higher_is_better: bool | None = True
+    winner: Literal["left", "right", "tie"] | None = None
+
+
+class PlayerComparison(BaseModel):
+    """Готовое сравнение двух игроков."""
+
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
+    left: PlayerStats
+    right: PlayerStats
+    metrics: tuple[ComparisonMetric, ...] = ()
+
+    @property
+    def has_data(self) -> bool:
+        """Есть ли хотя бы одно значение для сравнения."""
+        return any(
+            metric.left is not None or metric.right is not None
+            for metric in self.metrics
+        )
+
 
 
 def _lookup(data: Mapping[str, Any], *keys: str) -> Any:
@@ -807,3 +853,112 @@ def build_player_stats(
         ),
         steam=steam,
     )
+
+
+def _signed_streak(stats: PlayerStats) -> int | None:
+    """Возвращает текущую серию как число: победы > 0, поражения < 0."""
+    length = stats.lifetime.current_streak
+    is_win = stats.lifetime.current_streak_is_win
+    if length is None or is_win is None or length < 1:
+        return None
+    return length if is_win else -length
+
+
+def _comparison_metric(
+    key: ComparisonMetricKey,
+    label: str,
+    left: float | int | None,
+    right: float | int | None,
+    *,
+    higher_is_better: bool | None = True,
+) -> ComparisonMetric:
+    """Создаёт строку сравнения и определяет победителя по метрике."""
+    left_value = None if left is None else float(left)
+    right_value = None if right is None else float(right)
+
+    delta: float | None = None
+    winner: Literal["left", "right", "tie"] | None = None
+
+    if left_value is not None and right_value is not None:
+        delta = left_value - right_value
+        if higher_is_better is not None:
+            if delta > 0:
+                winner = "left"
+            elif delta < 0:
+                winner = "right"
+            else:
+                winner = "tie"
+
+    return ComparisonMetric(
+        key=key,
+        label=label,
+        left=left_value,
+        right=right_value,
+        delta=delta,
+        higher_is_better=higher_is_better,
+        winner=winner,
+    )
+
+
+def build_player_comparison(
+    left: PlayerStats,
+    right: PlayerStats,
+) -> PlayerComparison:
+    """Сопоставляет ключевые показатели двух игроков.
+
+    ``delta`` считается как значение первого игрока минус значение второго.
+    Для часов в CS2 победитель не определяется: это нейтральный показатель.
+    """
+    left_form = left.form
+    right_form = right.form
+    left_steam = left.steam
+    right_steam = right.steam
+
+    metrics = (
+        _comparison_metric(
+            "elo",
+            "ELO",
+            left.profile.faceit_elo,
+            right.profile.faceit_elo,
+        ),
+        _comparison_metric(
+            "winrate",
+            "Винрейт",
+            left.lifetime.winrate,
+            right.lifetime.winrate,
+        ),
+        _comparison_metric(
+            "kd",
+            "K/D",
+            left.lifetime.kd,
+            right.lifetime.kd,
+        ),
+        _comparison_metric(
+            "hs",
+            "HS%",
+            left.lifetime.headshots_pct,
+            right.lifetime.headshots_pct,
+        ),
+        _comparison_metric(
+            "adr",
+            "ADR",
+            left_form.avg_adr if left_form is not None else None,
+            right_form.avg_adr if right_form is not None else None,
+        ),
+        _comparison_metric(
+            "streak",
+            "Текущая серия",
+            _signed_streak(left),
+            _signed_streak(right),
+        ),
+        _comparison_metric(
+            "hours",
+            "CS2",
+            left_steam.cs2_hours if left_steam is not None else None,
+            right_steam.cs2_hours if right_steam is not None else None,
+            higher_is_better=None,
+        ),
+    )
+
+    return PlayerComparison(left=left, right=right, metrics=metrics)
+

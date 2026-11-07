@@ -21,9 +21,14 @@ from bot.steam import SteamStats
 from bot.stats import RECENT_MATCHES_FETCH_LIMIT
 
 STEAM_ID64 = "76561198000000000"
+STEAM_ID64_TWO = "76561198000000001"
 PLAYER_ID = "8f3d6f0e-6a6c-4f7f-9a4b-1c2d3e4f5a6b"
+PLAYER_TWO_ID = "9a4b1c2d-3e4f-5a6b-7c8d-9e0f1a2b3c4d"
 CHAT = Chat(id=100, type="private")
 USER = User(id=100, is_bot=False, first_name="Tester")
+
+URL_ONE = "https://steamcommunity.com/id/test"
+URL_TWO = "https://steamcommunity.com/id/rival"
 
 PLAYER = {
     "player_id": PLAYER_ID,
@@ -106,6 +111,65 @@ MATCH_DETAILS = {
     },
 }
 
+PLAYER_TWO = {
+    "player_id": PLAYER_TWO_ID,
+    "nickname": "RivalPlayer",
+    "country": "ru",
+    "faceit_url": "https://www.faceit.com/ru/players/RivalPlayer",
+    "games": {
+        "cs2": {
+            "region": "EU",
+            "faceit_elo": 2100,
+            "skill_level": 9,
+        }
+    },
+}
+
+LIFETIME_TWO = {
+    "player_id": PLAYER_TWO_ID,
+    "lifetime": {
+        "Matches": "100",
+        "Win Rate %": "60",
+        "Average K/D Ratio": "1.10",
+        "Average Headshots %": "52",
+        "Longest Win Streak": "8",
+        "Current Win Streak": "0",
+    },
+    "segments": [],
+}
+
+RECENT_TWO = {
+    "player_id": PLAYER_TWO_ID,
+    "items": [
+        {
+            "match_id": "match-3",
+            "elo": 2100,
+            "stats": {
+                "Result": "0",
+                "K/D Ratio": "0.8",
+                "ADR": "70.2",
+                "Kills": "12",
+                "Deaths": "15",
+                "Assists": "4",
+                "Map": "de_nuke",
+            },
+        },
+        {
+            "match_id": "match-4",
+            "elo": 2110,
+            "stats": {
+                "Result": "1",
+                "K/D Ratio": "1.4",
+                "ADR": "75.0",
+                "Kills": "21",
+                "Deaths": "15",
+                "Assists": "6",
+                "Map": "de_ancient",
+            },
+        },
+    ],
+}
+
 RANKING_COUNTRY = {"position": 12}
 RANKING_REGION = {"position": 345}
 
@@ -149,6 +213,12 @@ class FakeFaceitClient:
         region_ranking: dict[str, Any] | None = RANKING_REGION,
         match_details: dict[str, dict[str, Any]] | None = None,
         ranking_error: Exception | None = None,
+        players_by_steam: dict[str, dict[str, Any] | None] | None = None,
+        lifetime_by_player: (
+            dict[str, dict[str, Any] | None] | None
+        ) = None,
+        recent_by_player: dict[str, dict[str, Any] | None] | None = None,
+        player_errors: dict[str, Exception] | None = None,
     ) -> None:
         self.player = player
         self.lifetime = lifetime
@@ -159,6 +229,10 @@ class FakeFaceitClient:
             MATCH_DETAILS if match_details is None else match_details
         )
         self.ranking_error = ranking_error
+        self.players_by_steam = players_by_steam
+        self.lifetime_by_player = lifetime_by_player
+        self.recent_by_player = recent_by_player
+        self.player_errors = player_errors
         self.cache_cleared = False
         self.recent_limits: list[int] = []
         self.ranking_calls: list[tuple[str, str, str | None]] = []
@@ -168,12 +242,18 @@ class FakeFaceitClient:
         self,
         steam64: str,
     ) -> dict[str, Any] | None:
+        if self.player_errors is not None and steam64 in self.player_errors:
+            raise self.player_errors[steam64]
+        if self.players_by_steam is not None:
+            return self.players_by_steam.get(steam64)
         return self.player
 
     async def get_lifetime_stats(
         self,
         player_id: str,
     ) -> dict[str, Any] | None:
+        if self.lifetime_by_player is not None:
+            return self.lifetime_by_player.get(player_id)
         return self.lifetime
 
     async def get_recent_matches(
@@ -182,6 +262,8 @@ class FakeFaceitClient:
         limit: int = 20,
     ) -> dict[str, Any] | None:
         self.recent_limits.append(limit)
+        if self.recent_by_player is not None:
+            return self.recent_by_player.get(player_id)
         return self.recent
 
     async def get_player_ranking(
@@ -223,6 +305,45 @@ def patch_steam(
             raise error
         return steam_stats
 
+    monkeypatch.setattr(handlers, "fetch_steam_stats", fake_fetch_steam_stats)
+
+
+def make_compare_client(
+    *,
+    players_by_steam: dict[str, dict[str, Any] | None] | None = None,
+    lifetime_by_player: (
+        dict[str, dict[str, Any] | None] | None
+    ) = None,
+    recent_by_player: dict[str, dict[str, Any] | None] | None = None,
+    player_errors: dict[str, Exception] | None = None,
+) -> FakeFaceitClient:
+    return FakeFaceitClient(
+        players_by_steam=players_by_steam,
+        lifetime_by_player=lifetime_by_player,
+        recent_by_player=recent_by_player,
+        player_errors=player_errors,
+    )
+
+
+def patch_compare_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    steam_by_steam: dict[str, SteamStats | None] | None = None,
+) -> None:
+    """Мокает Steam и SteamID-резолвер для сценария сравнения."""
+
+    async def fake_resolve_steam_id(value: str) -> str | None:
+        return {
+            URL_ONE: STEAM_ID64,
+            URL_TWO: STEAM_ID64_TWO,
+        }.get(value)
+
+    async def fake_fetch_steam_stats(steam64: str) -> SteamStats | None:
+        if steam_by_steam is None:
+            return None
+        return steam_by_steam.get(steam64)
+
+    monkeypatch.setattr(handlers, "resolve_steam_id", fake_resolve_steam_id)
     monkeypatch.setattr(handlers, "fetch_steam_stats", fake_fetch_steam_stats)
 
 
@@ -498,4 +619,327 @@ async def test_refresh_callback_clears_cache_and_edits_message(
     assert (
         edits[0].reply_markup.inline_keyboard[1][0].callback_data
         == f"refresh:{STEAM_ID64}"
+    )
+
+@pytest.mark.asyncio
+async def test_handle_compare_command_sends_comparison(
+    bot: Bot,
+    dispatcher: Dispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    faceit_client = make_compare_client(
+        players_by_steam={
+            STEAM_ID64: PLAYER,
+            STEAM_ID64_TWO: PLAYER_TWO,
+        },
+        lifetime_by_player={
+            PLAYER_ID: LIFETIME,
+            PLAYER_TWO_ID: LIFETIME_TWO,
+        },
+        recent_by_player={
+            PLAYER_ID: RECENT,
+            PLAYER_TWO_ID: RECENT_TWO,
+        },
+    )
+    setup_dispatcher(dispatcher, faceit_client)
+    patch_compare_dependencies(
+        monkeypatch,
+        steam_by_steam={
+            STEAM_ID64: SteamStats(cs2_hours=100, vac_banned=False),
+            STEAM_ID64_TWO: SteamStats(cs2_hours=200, vac_banned=False),
+        },
+    )
+
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=1,
+            message=make_message(f"/compare {URL_ONE} {URL_TWO}"),
+        ),
+    )
+
+    messages = send_messages(bot)
+    assert len(messages) == 1
+    sent = messages[0]
+    text = sent.text or ""
+
+    assert "⚔️ <b>Сравнение игроков</b>" in text
+    assert "TestPlayer" in text
+    assert "RivalPlayer" in text
+    assert "• ELO: <b>2345</b> 🏆 vs 2100 · Δ +245" in text
+    assert "• Винрейт: 55% vs <b>60%</b> 🏆 · Δ −5 п.п." in text
+    assert "• K/D: <b>1.25</b> 🏆 vs 1.10 · Δ +0.15" in text
+    assert "• CS2: 100 ч vs 200 ч · Δ −100 ч" in text
+    assert "Обновлено" in text
+
+    assert faceit_client.recent_limits == [
+        RECENT_MATCHES_FETCH_LIMIT,
+        RECENT_MATCHES_FETCH_LIMIT,
+    ]
+
+    assert sent.reply_markup is not None
+    keyboard = sent.reply_markup.inline_keyboard
+    assert keyboard[0][0].text == "1. TestPlayer"
+    assert keyboard[0][1].text == "2. RivalPlayer"
+    assert keyboard[1][0].text == "🔄 Обновить сравнение"
+    assert keyboard[1][0].callback_data == (
+        f"refresh_compare:{STEAM_ID64}:{STEAM_ID64_TWO}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_link_with_two_urls_starts_comparison(
+    bot: Bot,
+    dispatcher: Dispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    faceit_client = make_compare_client(
+        players_by_steam={
+            STEAM_ID64: PLAYER,
+            STEAM_ID64_TWO: PLAYER_TWO,
+        },
+        lifetime_by_player={
+            PLAYER_ID: LIFETIME,
+            PLAYER_TWO_ID: LIFETIME_TWO,
+        },
+        recent_by_player={
+            PLAYER_ID: RECENT,
+            PLAYER_TWO_ID: RECENT_TWO,
+        },
+    )
+    setup_dispatcher(dispatcher, faceit_client)
+    patch_compare_dependencies(monkeypatch)
+
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=1,
+            message=make_message(f"Сравни: {URL_ONE} и {URL_TWO}"),
+        ),
+    )
+
+    messages = send_messages(bot)
+    assert len(messages) == 1
+    assert "Сравнение игроков" in (messages[0].text or "")
+
+
+@pytest.mark.asyncio
+async def test_handle_compare_usage_for_missing_second_link(
+    bot: Bot,
+    dispatcher: Dispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_dispatcher(dispatcher, make_compare_client())
+    patch_compare_dependencies(monkeypatch)
+
+    await dispatcher.feed_update(
+        bot,
+        Update(update_id=1, message=make_message("/compare")),
+    )
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=2,
+            message=make_message(f"/compare {URL_ONE}"),
+        ),
+    )
+
+    messages = send_messages(bot)
+    assert [message.text for message in messages] == [
+        handlers.COMPARE_USAGE_MESSAGE,
+        handlers.COMPARE_ONE_LINK_MESSAGE,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_compare_reports_same_player(
+    bot: Bot,
+    dispatcher: Dispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_dispatcher(dispatcher, make_compare_client())
+    patch_compare_dependencies(monkeypatch)
+
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=1,
+            message=make_message(f"/compare {URL_ONE} {URL_ONE}"),
+        ),
+    )
+
+    messages = send_messages(bot)
+    assert len(messages) == 1
+    assert messages[0].text == handlers.COMPARE_SAME_PLAYER_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_handle_compare_reports_missing_second_player(
+    bot: Bot,
+    dispatcher: Dispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_dispatcher(
+        dispatcher,
+        make_compare_client(
+            players_by_steam={
+                STEAM_ID64: PLAYER,
+                STEAM_ID64_TWO: None,
+            },
+            lifetime_by_player={
+                PLAYER_ID: LIFETIME,
+                PLAYER_TWO_ID: LIFETIME_TWO,
+            },
+            recent_by_player={
+                PLAYER_ID: RECENT,
+                PLAYER_TWO_ID: RECENT_TWO,
+            },
+        ),
+    )
+    patch_compare_dependencies(monkeypatch)
+
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=1,
+            message=make_message(f"/compare {URL_ONE} {URL_TWO}"),
+        ),
+    )
+
+    messages = send_messages(bot)
+    assert len(messages) == 1
+    assert messages[0].text == handlers.COMPARE_SECOND_NOT_FOUND_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_handle_compare_reports_rate_limit_for_one_player(
+    bot: Bot,
+    dispatcher: Dispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_dispatcher(
+        dispatcher,
+        make_compare_client(
+            players_by_steam={
+                STEAM_ID64: PLAYER,
+                STEAM_ID64_TWO: PLAYER_TWO,
+            },
+            lifetime_by_player={
+                PLAYER_ID: LIFETIME,
+                PLAYER_TWO_ID: LIFETIME_TWO,
+            },
+            recent_by_player={
+                PLAYER_ID: RECENT,
+                PLAYER_TWO_ID: RECENT_TWO,
+            },
+            player_errors={
+                STEAM_ID64_TWO: handlers.FaceitRateLimit("rate limit"),
+            },
+        ),
+    )
+    patch_compare_dependencies(monkeypatch)
+
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=1,
+            message=make_message(f"/compare {URL_ONE} {URL_TWO}"),
+        ),
+    )
+
+    messages = send_messages(bot)
+    assert len(messages) == 1
+    assert messages[0].text == handlers.FACEIT_RATE_LIMIT_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_handle_compare_reports_invalid_link(
+    bot: Bot,
+    dispatcher: Dispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_dispatcher(dispatcher, make_compare_client())
+
+    async def fake_resolve_steam_id(value: str) -> str | None:
+        return None
+
+    monkeypatch.setattr(handlers, "resolve_steam_id", fake_resolve_steam_id)
+
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=1,
+            message=make_message(
+                "https://example.com/one https://example.com/two"
+            ),
+        ),
+    )
+
+    messages = send_messages(bot)
+    assert len(messages) == 1
+    assert messages[0].text == handlers.COMPARE_INVALID_STEAM_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_handle_compare_refresh_clears_cache_and_edits_message(
+    bot: Bot,
+    dispatcher: Dispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    faceit_client = make_compare_client(
+        players_by_steam={
+            STEAM_ID64: PLAYER,
+            STEAM_ID64_TWO: PLAYER_TWO,
+        },
+        lifetime_by_player={
+            PLAYER_ID: LIFETIME,
+            PLAYER_TWO_ID: LIFETIME_TWO,
+        },
+        recent_by_player={
+            PLAYER_ID: RECENT,
+            PLAYER_TWO_ID: RECENT_TWO,
+        },
+    )
+    setup_dispatcher(dispatcher, faceit_client)
+    patch_compare_dependencies(monkeypatch)
+
+    old_message = make_message("старое сравнение", message_id=2)
+    callback = CallbackQuery(
+        id="callback-1",
+        from_user=USER,
+        chat_instance="chat-instance",
+        data=(
+            f"refresh_compare:{STEAM_ID64}:{STEAM_ID64_TWO}"
+        ),
+        message=old_message,
+    )
+
+    await dispatcher.feed_update(
+        bot,
+        Update(update_id=2, callback_query=callback),
+    )
+
+    assert faceit_client.cache_cleared is True
+
+    answers = [
+        method
+        for method in bot.session.requests
+        if isinstance(method, AnswerCallbackQuery)
+    ]
+    assert answers
+    assert answers[0].text == "Обновляю сравнение…"
+
+    edits = [
+        method
+        for method in bot.session.requests
+        if isinstance(method, EditMessageText)
+    ]
+    assert len(edits) == 1
+    assert "Сравнение игроков" in (edits[0].text or "")
+    assert "TestPlayer" in (edits[0].text or "")
+    assert "RivalPlayer" in (edits[0].text or "")
+    assert edits[0].reply_markup is not None
+    assert (
+        edits[0].reply_markup.inline_keyboard[1][0].callback_data
+        == f"refresh_compare:{STEAM_ID64}:{STEAM_ID64_TWO}"
     )

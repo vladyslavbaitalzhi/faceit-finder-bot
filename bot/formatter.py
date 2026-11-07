@@ -8,8 +8,10 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.stats import (
     MIN_MAP_MATCHES,
+    ComparisonMetric,
     MapPerformance,
     MatchSummary,
+    PlayerComparison,
     PlayerProfile,
     PlayerStats,
 )
@@ -448,6 +450,220 @@ def format_player_stats(
     sections.append(f"<i>Обновлено {timestamp}</i>")
 
     return _limit_message("\n\n".join(sections))
+
+
+def _format_signed(value: float | int | None, digits: int) -> str | None:
+    """Форматирует число со знаком +/− и нужным количеством знаков."""
+    if value is None:
+        return None
+
+    rounded = round(float(value), digits)
+    if rounded == 0:
+        return "0"
+
+    sign = "+" if rounded > 0 else "−"
+    absolute = abs(rounded)
+    if digits == 0:
+        return f"{sign}{int(absolute)}"
+    return f"{sign}{absolute:.{digits}f}"
+
+
+def _format_signed_trimmed(
+    value: float | int | None,
+    digits: int,
+) -> str | None:
+    """Форматирует число со знаком, убирая лишние нули после запятой."""
+    if value is None:
+        return None
+
+    rounded = round(float(value), digits)
+    if rounded == 0:
+        return "0"
+
+    sign = "+" if rounded > 0 else "−"
+    absolute = abs(rounded)
+    if absolute.is_integer():
+        return f"{sign}{int(absolute)}"
+    return f"{sign}{absolute:.{digits}f}"
+
+
+def _format_signed_percent(value: float | int | None) -> str | None:
+    """Форматирует разницу в процентных пунктах без лишнего нуля."""
+    return _format_signed_trimmed(value, 1)
+
+
+def _format_comparison_value(
+    metric: ComparisonMetric,
+    value: float | None,
+) -> str | None:
+    """Форматирует значение метрики для сравнительной строки."""
+    if value is None:
+        return None
+
+    if metric.key == "elo":
+        return str(int(round(value)))
+    if metric.key == "winrate":
+        return _format_percent(value)
+    if metric.key == "kd":
+        return _format_float(value, 2)
+    if metric.key == "hs":
+        return _format_percent(value)
+    if metric.key == "adr":
+        return _format_float(value, 1)
+    if metric.key == "streak":
+        count = int(round(abs(value)))
+        if count < 1:
+            return None
+        if value > 0:
+            word = _plural(count, "победа", "победы", "побед")
+        else:
+            word = _plural(count, "поражение", "поражения", "поражений")
+        return f"{count} {word}"
+    if metric.key == "hours":
+        return _format_hours(value)
+
+    return _format_float(value, 2)
+
+
+def _format_comparison_delta(metric: ComparisonMetric) -> str | None:
+    """Форматирует разницу по метрике в её единицах измерения."""
+    if metric.delta is None:
+        return None
+
+    if metric.key in {"winrate", "hs"}:
+        return f"Δ {_format_signed_percent(metric.delta)} п.п."
+    if metric.key == "elo":
+        return f"Δ {_format_signed(metric.delta, 0)}"
+    if metric.key == "kd":
+        return f"Δ {_format_signed(metric.delta, 2)}"
+    if metric.key == "adr":
+        return f"Δ {_format_signed(metric.delta, 1)}"
+    if metric.key == "streak":
+        return f"Δ {_format_signed(metric.delta, 0)}"
+    if metric.key == "hours":
+        return f"Δ {_format_signed_trimmed(metric.delta, 1)} ч"
+
+    return f"Δ {_format_signed(metric.delta, 2)}"
+
+
+def _format_comparison_header(stats: PlayerStats, marker: str) -> str:
+    """Формирует шапку одного участника сравнения."""
+    profile = stats.profile
+    nickname = _escape(profile.nickname, max_length=MAX_NICKNAME_LENGTH)
+    profile_url = html.escape(
+        _truncate(profile.profile_url, MAX_URL_LENGTH),
+        quote=True,
+    )
+
+    header = f'{marker} <b><a href="{profile_url}">{nickname}</a></b>'
+    flag = _country_flag(profile.country)
+    if flag is not None:
+        header = f"{header} {flag}"
+
+    badge_parts: list[str] = []
+    if profile.skill_level is not None:
+        badge_parts.append(f"Уровень {profile.skill_level}")
+    if profile.faceit_elo is not None:
+        badge_parts.append(f"{profile.faceit_elo} ELO")
+    if badge_parts:
+        header += f"\n🏅 {' · '.join(badge_parts)}"
+
+    return header
+
+
+def format_player_comparison(
+    comparison: PlayerComparison,
+    *,
+    updated_at: datetime | None = None,
+) -> str:
+    """Формирует компактное Telegram HTML-сообщение со сравнением.
+
+    Лучший показатель каждой метрики выделяется жирным шрифтом и 🏆.
+    ``Δ`` считается как значение первого игрока минус значение второго.
+    """
+    sections: list[str] = [
+        "⚔️ <b>Сравнение игроков</b>",
+        "\n".join(
+            (
+                _format_comparison_header(comparison.left, "1️⃣"),
+                _format_comparison_header(comparison.right, "2️⃣"),
+            )
+        ),
+    ]
+
+    metric_lines: list[str] = []
+    has_winner = False
+
+    for metric in comparison.metrics:
+        left_text = _format_comparison_value(metric, metric.left)
+        right_text = _format_comparison_value(metric, metric.right)
+
+        if left_text is None and right_text is None:
+            continue
+
+        left_display = left_text if left_text is not None else "—"
+        right_display = right_text if right_text is not None else "—"
+
+        if metric.winner == "left":
+            left_display = f"<b>{left_display}</b> 🏆"
+            has_winner = True
+        elif metric.winner == "right":
+            right_display = f"<b>{right_display}</b> 🏆"
+            has_winner = True
+
+        line = f"• {metric.label}: {left_display} vs {right_display}"
+        delta = _format_comparison_delta(metric)
+        if delta is not None:
+            line += f" · {delta}"
+        metric_lines.append(line)
+
+    if metric_lines:
+        sections.append(
+            "📊 <b>Ключевые показатели</b>\n" + "\n".join(metric_lines)
+        )
+        if has_winner:
+            sections.append(
+                "<i>🏆 — лучший показатель · "
+                "Δ — разница (1-й минус 2-й)</i>"
+            )
+    else:
+        sections.append("<i>Недостаточно данных для сравнения.</i>")
+
+    timestamp = (updated_at or datetime.now()).strftime("%H:%M")
+    sections.append(f"<i>Обновлено {timestamp}</i>")
+
+    return _limit_message("\n\n".join(sections))
+
+
+def build_comparison_keyboard(
+    comparison: PlayerComparison,
+    *,
+    refresh_callback_data: str,
+) -> InlineKeyboardMarkup:
+    """Создаёт клавиатуру сравнения: два профиля и кнопка обновления."""
+    left_name = _truncate(comparison.left.profile.nickname, 18)
+    right_name = _truncate(comparison.right.profile.nickname, 18)
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"1. {left_name}",
+                    url=comparison.left.profile.profile_url,
+                ),
+                InlineKeyboardButton(
+                    text=f"2. {right_name}",
+                    url=comparison.right.profile.profile_url,
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔄 Обновить сравнение",
+                    callback_data=refresh_callback_data,
+                )
+            ],
+        ]
+    )
 
 
 def build_player_keyboard(

@@ -8,8 +8,12 @@ import pytest
 from bot.steam import SteamStats
 from bot.stats import (
     MIN_MAP_MATCHES,
+    LifetimeSummary,
     PlayerProfile,
     PlayerRanking,
+    PlayerStats,
+    RecentForm,
+    build_player_comparison,
     build_player_ranking,
     build_player_stats,
 )
@@ -613,3 +617,168 @@ def test_profile_url_fallback() -> None:
     assert profile.profile_url == (
         "https://www.faceit.com/en/players/Test%20Player"
     )
+
+
+def _make_comparison_player(
+    player_id: str,
+    nickname: str,
+    *,
+    elo: int | None = None,
+    level: int | None = None,
+    winrate: float | None = None,
+    kd: float | None = None,
+    hs: float | None = None,
+    adr: float | None = None,
+    streak: int | None = None,
+    streak_is_win: bool | None = None,
+    hours: float | None = None,
+) -> PlayerStats:
+    form = (
+        RecentForm(analyzed_matches=20, avg_adr=adr)
+        if adr is not None
+        else None
+    )
+    steam = SteamStats(cs2_hours=hours) if hours is not None else None
+    return PlayerStats(
+        profile=PlayerProfile(
+            player_id=player_id,
+            nickname=nickname,
+            faceit_elo=elo,
+            skill_level=level,
+        ),
+        lifetime=LifetimeSummary(
+            winrate=winrate,
+            kd=kd,
+            headshots_pct=hs,
+            current_streak=streak,
+            current_streak_is_win=streak_is_win,
+        ),
+        form=form,
+        steam=steam,
+    )
+
+
+def test_build_player_comparison_marks_winners_and_deltas() -> None:
+    left = _make_comparison_player(
+        "left",
+        "Alpha",
+        elo=2345,
+        level=10,
+        winrate=55,
+        kd=1.25,
+        hs=48,
+        adr=77.4,
+        streak=2,
+        streak_is_win=True,
+        hours=1234.5,
+    )
+    right = _make_comparison_player(
+        "right",
+        "Beta",
+        elo=2100,
+        level=9,
+        winrate=60,
+        kd=1.10,
+        hs=52,
+        adr=70.2,
+        streak=3,
+        streak_is_win=False,
+        hours=2100,
+    )
+
+    comparison = build_player_comparison(left, right)
+    metrics = {metric.key: metric for metric in comparison.metrics}
+
+    assert comparison.has_data is True
+
+    assert metrics["elo"].winner == "left"
+    assert metrics["elo"].delta == 245
+
+    assert metrics["winrate"].winner == "right"
+    assert metrics["winrate"].delta == -5
+
+    assert metrics["kd"].winner == "left"
+    assert metrics["kd"].delta == pytest.approx(0.15)
+
+    assert metrics["hs"].winner == "right"
+    assert metrics["hs"].delta == -4
+
+    assert metrics["adr"].winner == "left"
+    assert metrics["adr"].delta == pytest.approx(7.2)
+
+    assert metrics["streak"].winner == "left"
+    assert metrics["streak"].delta == 5
+
+    assert metrics["hours"].winner is None
+    assert metrics["hours"].higher_is_better is None
+    assert metrics["hours"].delta == pytest.approx(-865.5)
+
+
+def test_build_player_comparison_handles_missing_values_and_ties() -> None:
+    left = _make_comparison_player(
+        "left",
+        "Alpha",
+        elo=2000,
+        winrate=50,
+        kd=1.0,
+        adr=80,
+    )
+    right = _make_comparison_player(
+        "right",
+        "Beta",
+        elo=2000,
+        winrate=50,
+        kd=1.0,
+    )
+
+    comparison = build_player_comparison(left, right)
+    metrics = {metric.key: metric for metric in comparison.metrics}
+
+    assert metrics["elo"].winner == "tie"
+    assert metrics["elo"].delta == 0
+    assert metrics["winrate"].winner == "tie"
+    assert metrics["kd"].winner == "tie"
+
+    assert metrics["adr"].left == 80
+    assert metrics["adr"].right is None
+    assert metrics["adr"].delta is None
+    assert metrics["adr"].winner is None
+
+    assert metrics["hs"].left is None
+    assert metrics["hs"].right is None
+    assert metrics["hours"].left is None
+    assert metrics["hours"].right is None
+
+
+def test_build_player_comparison_signed_streaks() -> None:
+    left = _make_comparison_player(
+        "left",
+        "Alpha",
+        streak=2,
+        streak_is_win=False,
+    )
+    right = _make_comparison_player(
+        "right",
+        "Beta",
+        streak=5,
+        streak_is_win=False,
+    )
+
+    comparison = build_player_comparison(left, right)
+    streak = next(
+        metric for metric in comparison.metrics if metric.key == "streak"
+    )
+
+    assert streak.left == -2
+    assert streak.right == -5
+    assert streak.delta == 3
+    assert streak.winner == "left"
+
+
+def test_build_player_comparison_without_data() -> None:
+    left = _make_comparison_player("left", "Alpha")
+    right = _make_comparison_player("right", "Beta")
+
+    comparison = build_player_comparison(left, right)
+
+    assert comparison.has_data is False
