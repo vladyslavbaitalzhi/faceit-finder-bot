@@ -32,6 +32,8 @@ MENU_HELP_TEXT = "ℹ️ Помощь"
 MENU_CANCEL_TEXT = "✖️ Отмена"
 MENU_MAIN_TEXT = "⬅️ В главное меню"
 
+CANCEL_TEXTS = {MENU_CANCEL_TEXT.casefold(), "отмена", "/cancel"}
+
 MENU_FIND_CALLBACK = "menu:find"
 MENU_COMPARE_CALLBACK = "menu:compare"
 MENU_HELP_CALLBACK = "menu:help"

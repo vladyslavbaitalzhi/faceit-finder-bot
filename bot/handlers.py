@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 from collections.abc import Awaitable, Mapping
 from html import escape as escape_html
@@ -17,8 +18,8 @@ from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 
 from bot.faceit import FaceitClient, FaceitError, FaceitNotFound, FaceitRateLimit
 from bot.formatter import (
+    CANCEL_TEXTS,
     MENU_CANCEL_CALLBACK,
-    MENU_CANCEL_TEXT,
     MENU_COMPARE_CALLBACK,
     MENU_COMPARE_TEXT,
     MENU_FIND_CALLBACK,
@@ -35,6 +36,7 @@ from bot.formatter import (
     format_player_comparison,
     format_player_stats,
 )
+from bot.rate_limit import RefreshCooldown
 from bot.steam import (
     STEAM_ID64_RE,
     SteamStats,
@@ -70,7 +72,6 @@ REFRESH_CALLBACK_PREFIX = "refresh:"
 REFRESH_COMPARE_CALLBACK_PREFIX = "refresh_compare:"
 COMPARE_SEPARATORS = {"vs", "vs.", "и", "and", "&", "против"}
 COMPARE_LEFT_STEAM64_KEY = "compare_left_steam64"
-CANCEL_TEXTS = {MENU_CANCEL_TEXT.casefold(), "отмена", "/cancel"}
 
 START_MESSAGE = (
     "<b>Привет!</b> 👋\n\n"
@@ -141,6 +142,10 @@ FLOW_INVALID_STEAM_MESSAGE = (
 
 FLOW_EXPIRED_MESSAGE = (
     "Сессия сравнения устарела. Начни сравнение заново."
+)
+
+REFRESH_FRESH_MESSAGE = (
+    "Данные уже свежие, обновлены {seconds} сек назад."
 )
 
 NO_LINK_MESSAGE = (
@@ -263,6 +268,28 @@ async def _send_typing(message: Message) -> None:
 def _is_cancel_text(text: str) -> bool:
     """Проверяет, что пользователь просит отменить пошаговый сценарий."""
     return text.strip().casefold() in CANCEL_TEXTS
+
+
+async def _refresh_is_allowed(
+    query: CallbackQuery,
+    targets: list[str],
+    refresh_cooldown: RefreshCooldown | None,
+) -> bool:
+    """Проверяет cooldown refresh и отвечает на callback, если он активен."""
+    if refresh_cooldown is None:
+        return True
+
+    status = refresh_cooldown.status(targets)
+    if not status.blocked:
+        return True
+
+    await query.answer(
+        REFRESH_FRESH_MESSAGE.format(
+            seconds=max(0, int(status.elapsed)),
+        ),
+        show_alert=False,
+    )
+    return False
 
 
 async def _edit_inline_or_answer(
@@ -396,10 +423,14 @@ async def _load_player_stats(
     country = player.get("country")
 
     requests: dict[str, Awaitable[Any]] = {
-        "lifetime": faceit_client.get_lifetime_stats(player_id),
+        "lifetime": faceit_client.get_lifetime_stats(
+            player_id,
+            steam64=steam64,
+        ),
         "recent": faceit_client.get_recent_matches(
             player_id,
             limit=RECENT_MATCHES_FETCH_LIMIT,
+            steam64=steam64,
         ),
         "steam": fetch_steam_stats(steam64),
     }
@@ -407,12 +438,14 @@ async def _load_player_stats(
         requests["region_ranking"] = faceit_client.get_player_ranking(
             player_id,
             region,
+            steam64=steam64,
         )
         if isinstance(country, str) and country:
             requests["country_ranking"] = faceit_client.get_player_ranking(
                 player_id,
                 region,
                 country=country,
+                steam64=steam64,
             )
 
     results = dict(
@@ -552,7 +585,7 @@ def _comparison_side_error(
         return COMPARE_SECOND_NOT_FOUND_MESSAGE
 
     if isinstance(error, FaceitRateLimit):
-        return FACEIT_RATE_LIMIT_MESSAGE
+        return _rate_limit_message(error)
 
     if side == 1:
         return COMPARE_FIRST_ERROR_MESSAGE
@@ -580,11 +613,13 @@ async def _build_comparison_message(
         if left_stats is None and right_stats is None:
             if left_error is None and right_error is None:
                 return COMPARE_BOTH_NOT_FOUND_MESSAGE, None
-            if isinstance(left_error, FaceitRateLimit) or isinstance(
-                right_error,
-                FaceitRateLimit,
-            ):
-                return FACEIT_RATE_LIMIT_MESSAGE, None
+            rate_limit_error = (
+                left_error
+                if isinstance(left_error, FaceitRateLimit)
+                else right_error
+            )
+            if isinstance(rate_limit_error, FaceitRateLimit):
+                return _rate_limit_message(rate_limit_error), None
             return COMPARE_BOTH_ERROR_MESSAGE, None
 
         if left_stats is None:
@@ -614,6 +649,7 @@ async def _send_comparison_result(
     left_steam64: str,
     right_steam64: str,
     faceit_client: FaceitClient,
+    refresh_cooldown: RefreshCooldown | None = None,
 ) -> None:
     """Загружает двух игроков и отправляет готовое сравнение."""
     await _send_typing(message)
@@ -639,11 +675,15 @@ async def _send_comparison_result(
         disable_web_page_preview=True,
     )
 
+    if keyboard is not None and refresh_cooldown is not None:
+        refresh_cooldown.mark([left_steam64, right_steam64])
+
 
 async def _handle_compare_request(
     message: Message,
     inputs: list[str],
     faceit_client: FaceitClient,
+    refresh_cooldown: RefreshCooldown | None = None,
 ) -> None:
     """Валидирует ввод и отправляет сравнение двух игроков."""
     resolved = await _resolve_compare_inputs(inputs)
@@ -657,6 +697,7 @@ async def _handle_compare_request(
         left_steam64,
         right_steam64,
         faceit_client,
+        refresh_cooldown,
     )
 
 
@@ -698,6 +739,7 @@ async def _handle_compare_first_input(
     message: Message,
     state: FSMContext,
     faceit_client: FaceitClient,
+    refresh_cooldown: RefreshCooldown | None = None,
 ) -> None:
     """Обрабатывает первый шаг пошагового сравнения."""
     inputs = _parse_compare_inputs(message.text or "")
@@ -709,7 +751,12 @@ async def _handle_compare_first_input(
         return
     if len(inputs) == 2:
         await state.clear()
-        await _handle_compare_request(message, inputs, faceit_client)
+        await _handle_compare_request(
+            message,
+            inputs,
+            faceit_client,
+            refresh_cooldown,
+        )
         return
 
     steam64 = await resolve_steam_id(inputs[0])
@@ -751,6 +798,7 @@ async def _handle_compare_second_input(
     message: Message,
     state: FSMContext,
     faceit_client: FaceitClient,
+    refresh_cooldown: RefreshCooldown | None = None,
 ) -> None:
     """Обрабатывает второй шаг пошагового сравнения."""
     data = await state.get_data()
@@ -789,13 +837,25 @@ async def _handle_compare_second_input(
         left_steam64,
         right_steam64,
         faceit_client,
+        refresh_cooldown,
+    )
+
+
+def _rate_limit_message(error: FaceitRateLimit) -> str:
+    """Добавляет к сообщению о 429 известное время ожидания."""
+    if error.retry_after is None:
+        return FACEIT_RATE_LIMIT_MESSAGE
+    seconds = max(1, math.ceil(error.retry_after))
+    return (
+        f"{FACEIT_RATE_LIMIT_MESSAGE} "
+        f"Повтори примерно через {seconds} сек."
     )
 
 
 def _error_message(error: Exception) -> str:
     """Подбирает понятный пользователю текст ошибки Faceit."""
     if isinstance(error, FaceitRateLimit):
-        return FACEIT_RATE_LIMIT_MESSAGE
+        return _rate_limit_message(error)
     return FACEIT_ERROR_MESSAGE
 
 
@@ -868,6 +928,7 @@ async def handle_compare(
     command: CommandObject,
     state: FSMContext,
     faceit_client: FaceitClient | None = None,
+    refresh_cooldown: RefreshCooldown | None = None,
 ) -> None:
     """Обрабатывает команду /compare с двумя Steam-идентификаторами."""
     await state.clear()
@@ -887,7 +948,12 @@ async def handle_compare(
         await message.answer(COMPARE_TOO_MANY_LINKS_MESSAGE)
         return
 
-    await _handle_compare_request(message, inputs, faceit_client)
+    await _handle_compare_request(
+        message,
+        inputs,
+        faceit_client,
+        refresh_cooldown,
+    )
 
 
 @router.message(F.text == MENU_FIND_TEXT)
@@ -940,6 +1006,7 @@ async def handle_compare_first_step(
     message: Message,
     state: FSMContext,
     faceit_client: FaceitClient | None = None,
+    refresh_cooldown: RefreshCooldown | None = None,
 ) -> None:
     """Принимает первого игрока в пошаговом сравнении."""
     if _is_cancel_text(message.text or ""):
@@ -950,7 +1017,12 @@ async def handle_compare_first_step(
         await message.answer(FACEIT_NOT_CONFIGURED_MESSAGE)
         return
 
-    await _handle_compare_first_input(message, state, faceit_client)
+    await _handle_compare_first_input(
+        message,
+        state,
+        faceit_client,
+        refresh_cooldown,
+    )
 
 
 @router.message(CompareFlow.waiting_second, F.text)
@@ -958,6 +1030,7 @@ async def handle_compare_second_step(
     message: Message,
     state: FSMContext,
     faceit_client: FaceitClient | None = None,
+    refresh_cooldown: RefreshCooldown | None = None,
 ) -> None:
     """Принимает второго игрока и отправляет сравнение."""
     if _is_cancel_text(message.text or ""):
@@ -968,13 +1041,19 @@ async def handle_compare_second_step(
         await message.answer(FACEIT_NOT_CONFIGURED_MESSAGE)
         return
 
-    await _handle_compare_second_input(message, state, faceit_client)
+    await _handle_compare_second_input(
+        message,
+        state,
+        faceit_client,
+        refresh_cooldown,
+    )
 
 
 @router.message(F.text)
 async def handle_link(
     message: Message,
     faceit_client: FaceitClient | None = None,
+    refresh_cooldown: RefreshCooldown | None = None,
 ) -> None:
     """Обрабатывает ссылку на Steam-профиль или две ссылки для сравнения."""
     urls = _extract_urls(message.text or "")
@@ -987,7 +1066,12 @@ async def handle_link(
         return
 
     if len(urls) == 2:
-        await _handle_compare_request(message, urls, faceit_client)
+        await _handle_compare_request(
+            message,
+            urls,
+            faceit_client,
+            refresh_cooldown,
+        )
         return
 
     if len(urls) > 2:
@@ -1023,6 +1107,9 @@ async def handle_link(
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
+
+    if refresh_cooldown is not None:
+        refresh_cooldown.mark([steam64])
 
 
 @router.callback_query(F.data == MENU_FIND_CALLBACK)
@@ -1131,6 +1218,7 @@ async def handle_menu_main(
 async def handle_refresh(
     query: CallbackQuery,
     faceit_client: FaceitClient | None = None,
+    refresh_cooldown: RefreshCooldown | None = None,
 ) -> None:
     """Обновляет статистику по нажатию inline-кнопки."""
     if faceit_client is None:
@@ -1155,6 +1243,19 @@ async def handle_refresh(
         )
         return
 
+    if not await _refresh_is_allowed(
+        query,
+        [steam64],
+        refresh_cooldown,
+    ):
+        return
+
+    # Резервируем cooldown сразу после проверки, до первого await:
+    # параллельный refresh той же цели увидит отметку и не запустит
+    # второй запрос к Faceit.
+    if refresh_cooldown is not None:
+        refresh_cooldown.mark([steam64])
+
     await query.answer("Обновляю статистику…")
 
     if query.bot is not None:
@@ -1163,14 +1264,18 @@ async def handle_refresh(
             action=ChatAction.TYPING,
         )
 
-    faceit_client.clear_cache()
+    faceit_client.invalidate_player_by_steam_id(steam64)
     try:
         stats = await _load_player_stats(steam64, faceit_client)
     except FaceitError as exc:
+        if refresh_cooldown is not None:
+            refresh_cooldown.release([steam64])
         logger.warning("Не удалось обновить статистику Faceit: %s", exc)
         await query.message.answer(_error_message(exc))
         return
     except Exception:
+        if refresh_cooldown is not None:
+            refresh_cooldown.release([steam64])
         logger.exception("Неожиданная ошибка при обновлении статистики")
         await query.message.answer(FACEIT_ERROR_MESSAGE)
         return
@@ -1208,6 +1313,7 @@ async def handle_refresh(
 async def handle_compare_refresh(
     query: CallbackQuery,
     faceit_client: FaceitClient | None = None,
+    refresh_cooldown: RefreshCooldown | None = None,
 ) -> None:
     """Обновляет сравнение двух игроков по inline-кнопке."""
     if faceit_client is None:
@@ -1239,10 +1345,24 @@ async def handle_compare_refresh(
         )
         return
 
+    targets = [left_steam64, right_steam64]
+    if not await _refresh_is_allowed(
+        query,
+        targets,
+        refresh_cooldown,
+    ):
+        return
+
+    # Резервируем cooldown до первого await, чтобы два параллельных
+    # refresh не дублировали запросы к Faceit.
+    if refresh_cooldown is not None:
+        refresh_cooldown.mark(targets)
+
     await query.answer("Обновляю сравнение…")
     await _send_typing(query.message)
 
-    faceit_client.clear_cache()
+    faceit_client.invalidate_player_by_steam_id(left_steam64)
+    faceit_client.invalidate_player_by_steam_id(right_steam64)
     try:
         text, keyboard = await _build_comparison_message(
             left_steam64,
@@ -1250,13 +1370,22 @@ async def handle_compare_refresh(
             faceit_client,
         )
     except FaceitError as exc:
+        if refresh_cooldown is not None:
+            refresh_cooldown.release(targets)
         logger.warning("Не удалось обновить сравнение: %s", exc)
         await query.message.answer(_error_message(exc))
         return
     except Exception:
+        if refresh_cooldown is not None:
+            refresh_cooldown.release(targets)
         logger.exception("Неожиданная ошибка при обновлении сравнения")
         await query.message.answer(FACEIT_ERROR_MESSAGE)
         return
+
+    if keyboard is None and refresh_cooldown is not None:
+        # Сравнение не построено (игрок не найден, 429 и т.п.):
+        # не удерживаем cooldown на неудачной загрузке.
+        refresh_cooldown.release(targets)
 
     try:
         await query.message.edit_text(

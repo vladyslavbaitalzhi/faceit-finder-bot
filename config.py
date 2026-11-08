@@ -22,5 +22,18 @@ class Settings(BaseSettings):
     steam_api_key: SecretStr | None = None
     faceit_api_key: SecretStr | None = None
 
+    rate_limit_requests: int = 10
+    rate_limit_window_seconds: float = 60.0
+    rate_limit_heavy_weight: int = 2
+
+    faceit_max_concurrency: int = 5
+    faceit_max_requests_per_second: float = 4.0
+    faceit_rate_limit_cooldown_seconds: float = 30.0
+    faceit_rate_limit_cooldown_max_seconds: float = 300.0
+    faceit_cache_max_entries: int = 2500
+    faceit_negative_cache_ttl_seconds: float = 60.0
+
+    refresh_cooldown_seconds: float = 60.0
+
 
 settings = Settings()

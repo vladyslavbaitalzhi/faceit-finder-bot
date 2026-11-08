@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator
 from datetime import datetime
 from typing import Any
 
+import httpx
 import pytest
 import pytest_asyncio
 from aiogram import Bot, Dispatcher
@@ -27,6 +29,7 @@ from aiogram.types import (
 )
 
 from bot import handlers
+from bot.faceit import FaceitClient
 from bot.formatter import (
     MENU_CANCEL_CALLBACK,
     MENU_COMPARE_CALLBACK,
@@ -35,11 +38,18 @@ from bot.formatter import (
     MENU_FIND_TEXT,
     MENU_HELP_TEXT,
 )
+from bot.rate_limit import (
+    RATE_LIMITED_MESSAGE,
+    RateLimitMiddleware,
+    RefreshCooldown,
+    SlidingWindowRateLimiter,
+)
 from bot.steam import SteamStats
 from bot.stats import RECENT_MATCHES_FETCH_LIMIT
 
 STEAM_ID64 = "76561198000000000"
 STEAM_ID64_TWO = "76561198000000001"
+STEAM_ID64_THREE = "76561198000000002"
 PLAYER_ID = "8f3d6f0e-6a6c-4f7f-9a4b-1c2d3e4f5a6b"
 PLAYER_TWO_ID = "9a4b1c2d-3e4f-5a6b-7c8d-9e0f1a2b3c4d"
 CHAT = Chat(id=100, type="private")
@@ -89,6 +99,7 @@ RECENT = {
                 "Deaths": "10",
                 "Assists": "5",
                 "Map": "de_mirage",
+                "Match Id": "match-1",
             },
         },
         {
@@ -101,6 +112,7 @@ RECENT = {
                 "Deaths": "20",
                 "Assists": "2",
                 "Map": "de_dust2",
+                "Match Id": "match-2",
             },
         },
     ],
@@ -251,7 +263,8 @@ class FakeFaceitClient:
         self.lifetime_by_player = lifetime_by_player
         self.recent_by_player = recent_by_player
         self.player_errors = player_errors
-        self.cache_cleared = False
+        self.invalidated_steam_ids: list[str] = []
+        self.player_lookup_calls: list[str] = []
         self.recent_limits: list[int] = []
         self.ranking_calls: list[tuple[str, str, str | None]] = []
         self.requested_match_ids: list[str] = []
@@ -260,6 +273,7 @@ class FakeFaceitClient:
         self,
         steam64: str,
     ) -> dict[str, Any] | None:
+        self.player_lookup_calls.append(steam64)
         if self.player_errors is not None and steam64 in self.player_errors:
             raise self.player_errors[steam64]
         if self.players_by_steam is not None:
@@ -269,6 +283,8 @@ class FakeFaceitClient:
     async def get_lifetime_stats(
         self,
         player_id: str,
+        *,
+        steam64: str | None = None,
     ) -> dict[str, Any] | None:
         if self.lifetime_by_player is not None:
             return self.lifetime_by_player.get(player_id)
@@ -278,6 +294,8 @@ class FakeFaceitClient:
         self,
         player_id: str,
         limit: int = 20,
+        *,
+        steam64: str | None = None,
     ) -> dict[str, Any] | None:
         self.recent_limits.append(limit)
         if self.recent_by_player is not None:
@@ -290,6 +308,7 @@ class FakeFaceitClient:
         region: str,
         *,
         country: str | None = None,
+        steam64: str | None = None,
     ) -> dict[str, Any] | None:
         self.ranking_calls.append((player_id, region, country))
         if self.ranking_error is not None:
@@ -305,8 +324,8 @@ class FakeFaceitClient:
         self.requested_match_ids.append(match_id)
         return self.match_details.get(match_id)
 
-    def clear_cache(self) -> None:
-        self.cache_cleared = True
+    def invalidate_player_by_steam_id(self, steam64: str) -> None:
+        self.invalidated_steam_ids.append(steam64)
 
 
 def patch_steam(
@@ -445,8 +464,11 @@ def send_messages(bot: Bot) -> list[SendMessage]:
 def setup_dispatcher(
     dispatcher: Dispatcher,
     faceit_client: FakeFaceitClient | None,
+    *,
+    refresh_cooldown: RefreshCooldown | None = None,
 ) -> None:
     dispatcher["faceit_client"] = faceit_client
+    dispatcher["refresh_cooldown"] = refresh_cooldown
 
 
 @pytest.mark.asyncio
@@ -630,7 +652,7 @@ async def test_handle_link_survives_optional_ranking_and_steam_errors(
 
 
 @pytest.mark.asyncio
-async def test_refresh_callback_clears_cache_and_edits_message(
+async def test_refresh_callback_invalidates_player_cache_and_edits_message(
     bot: Bot,
     dispatcher: Dispatcher,
     monkeypatch: pytest.MonkeyPatch,
@@ -656,7 +678,7 @@ async def test_refresh_callback_clears_cache_and_edits_message(
         Update(update_id=2, callback_query=callback),
     )
 
-    assert faceit_client.cache_cleared is True
+    assert faceit_client.invalidated_steam_ids == [STEAM_ID64]
 
     answers = [
         method
@@ -942,7 +964,7 @@ async def test_handle_compare_reports_invalid_link(
 
 
 @pytest.mark.asyncio
-async def test_handle_compare_refresh_clears_cache_and_edits_message(
+async def test_handle_compare_refresh_invalidates_both_players_and_edits_message(
     bot: Bot,
     dispatcher: Dispatcher,
     monkeypatch: pytest.MonkeyPatch,
@@ -980,7 +1002,10 @@ async def test_handle_compare_refresh_clears_cache_and_edits_message(
         Update(update_id=2, callback_query=callback),
     )
 
-    assert faceit_client.cache_cleared is True
+    assert faceit_client.invalidated_steam_ids == [
+        STEAM_ID64,
+        STEAM_ID64_TWO,
+    ]
 
     answers = [
         method
@@ -1334,3 +1359,602 @@ async def test_find_menu_then_single_link_shows_stats(
     assert "TestPlayer" in (messages[0].text or "")
     assert "Общая статистика" in (messages[0].text or "")
     assert await get_fsm_state(dispatcher, bot) is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_cooldown_blocks_repeated_refresh(
+    bot: Bot,
+    dispatcher: Dispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [1000.0]
+    cooldown = RefreshCooldown(60, clock=lambda: now[0])
+    faceit_client = FakeFaceitClient()
+    setup_dispatcher(
+        dispatcher,
+        faceit_client,
+        refresh_cooldown=cooldown,
+    )
+    patch_steam(
+        monkeypatch,
+        SteamStats(cs2_hours=100, vac_banned=False),
+    )
+
+    callback = CallbackQuery(
+        id="callback-1",
+        from_user=USER,
+        chat_instance="chat-instance",
+        data=f"refresh:{STEAM_ID64}",
+        message=make_message("старое сообщение", message_id=2),
+    )
+    await dispatcher.feed_update(
+        bot,
+        Update(update_id=1, callback_query=callback),
+    )
+
+    assert faceit_client.invalidated_steam_ids == [STEAM_ID64]
+    assert faceit_client.player_lookup_calls == [STEAM_ID64]
+    assert cooldown.status([STEAM_ID64]).blocked is True
+
+    bot.session.requests.clear()
+    callback = CallbackQuery(
+        id="callback-2",
+        from_user=USER,
+        chat_instance="chat-instance",
+        data=f"refresh:{STEAM_ID64}",
+        message=make_message("старое сообщение", message_id=2),
+    )
+    await dispatcher.feed_update(
+        bot,
+        Update(update_id=2, callback_query=callback),
+    )
+
+    assert faceit_client.invalidated_steam_ids == [STEAM_ID64]
+    assert faceit_client.player_lookup_calls == [STEAM_ID64]
+
+    answers = [
+        method
+        for method in bot.session.requests
+        if isinstance(method, AnswerCallbackQuery)
+    ]
+    assert len(answers) == 1
+    assert answers[0].text == (
+        "Данные уже свежие, обновлены 0 сек назад."
+    )
+    assert not [
+        method
+        for method in bot.session.requests
+        if isinstance(method, EditMessageText)
+    ]
+
+    now[0] += 61
+    bot.session.requests.clear()
+    callback = CallbackQuery(
+        id="callback-3",
+        from_user=USER,
+        chat_instance="chat-instance",
+        data=f"refresh:{STEAM_ID64}",
+        message=make_message("старое сообщение", message_id=2),
+    )
+    await dispatcher.feed_update(
+        bot,
+        Update(update_id=3, callback_query=callback),
+    )
+
+    assert faceit_client.invalidated_steam_ids == [
+        STEAM_ID64,
+        STEAM_ID64,
+    ]
+    assert faceit_client.player_lookup_calls == [STEAM_ID64, STEAM_ID64]
+    assert cooldown.status([STEAM_ID64]).blocked is True
+
+@pytest.mark.asyncio
+async def test_initial_profile_display_marks_refresh_cooldown(
+    bot: Bot,
+    dispatcher: Dispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [1000.0]
+    cooldown = RefreshCooldown(60, clock=lambda: now[0])
+    faceit_client = FakeFaceitClient()
+    setup_dispatcher(
+        dispatcher,
+        faceit_client,
+        refresh_cooldown=cooldown,
+    )
+    patch_steam(
+        monkeypatch,
+        SteamStats(cs2_hours=100, vac_banned=False),
+    )
+
+    async def fake_resolve(url: str) -> str:
+        return STEAM_ID64
+
+    monkeypatch.setattr(handlers, "resolve_steam_id", fake_resolve)
+
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=1,
+            message=make_message("https://steamcommunity.com/id/test"),
+        ),
+    )
+
+    assert cooldown.status([STEAM_ID64]).blocked is True
+    assert faceit_client.player_lookup_calls == [STEAM_ID64]
+    bot.session.requests.clear()
+
+    callback = CallbackQuery(
+        id="callback-1",
+        from_user=USER,
+        chat_instance="chat-instance",
+        data=f"refresh:{STEAM_ID64}",
+        message=make_message("старое сообщение", message_id=2),
+    )
+    await dispatcher.feed_update(
+        bot,
+        Update(update_id=2, callback_query=callback),
+    )
+
+    # Кнопка «Обновить» сразу после показа профиля не ходит в сеть.
+    assert faceit_client.invalidated_steam_ids == []
+    assert faceit_client.player_lookup_calls == [STEAM_ID64]
+    answers = [
+        method
+        for method in bot.session.requests
+        if isinstance(method, AnswerCallbackQuery)
+    ]
+    assert len(answers) == 1
+    assert answers[0].text == "Данные уже свежие, обновлены 0 сек назад."
+    assert not [
+        method
+        for method in bot.session.requests
+        if isinstance(method, EditMessageText)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_link_includes_known_retry_after(
+    bot: Bot,
+    dispatcher: Dispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_dispatcher(
+        dispatcher,
+        FakeFaceitClient(
+            player_errors={
+                STEAM_ID64: handlers.FaceitRateLimit(
+                    "rate limit",
+                    retry_after=17.2,
+                ),
+            },
+        ),
+    )
+    patch_steam(monkeypatch)
+
+    async def fake_resolve(url: str) -> str:
+        return STEAM_ID64
+
+    monkeypatch.setattr(handlers, "resolve_steam_id", fake_resolve)
+
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=1,
+            message=make_message("https://steamcommunity.com/id/test"),
+        ),
+    )
+
+    messages = send_messages(bot)
+    assert len(messages) == 1
+    assert messages[0].text == (
+        f"{handlers.FACEIT_RATE_LIMIT_MESSAGE} "
+        "Повтори примерно через 18 сек."
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_compare_includes_known_retry_after(
+    bot: Bot,
+    dispatcher: Dispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_dispatcher(
+        dispatcher,
+        make_compare_client(
+            players_by_steam={
+                STEAM_ID64: PLAYER,
+                STEAM_ID64_TWO: PLAYER_TWO,
+            },
+            lifetime_by_player={
+                PLAYER_ID: LIFETIME,
+                PLAYER_TWO_ID: LIFETIME_TWO,
+            },
+            recent_by_player={
+                PLAYER_ID: RECENT,
+                PLAYER_TWO_ID: RECENT_TWO,
+            },
+            player_errors={
+                STEAM_ID64_TWO: handlers.FaceitRateLimit(
+                    "rate limit",
+                    retry_after=5.1,
+                ),
+            },
+        ),
+    )
+    patch_compare_dependencies(monkeypatch)
+
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=1,
+            message=make_message(f"/compare {URL_ONE} {URL_TWO}"),
+        ),
+    )
+
+    messages = send_messages(bot)
+    assert len(messages) == 1
+    assert messages[0].text == (
+        f"{handlers.FACEIT_RATE_LIMIT_MESSAGE} "
+        "Повтори примерно через 6 сек."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("marked", "left", "right"),
+    [
+        ([STEAM_ID64, STEAM_ID64_TWO], STEAM_ID64_TWO, STEAM_ID64),
+        ([STEAM_ID64, STEAM_ID64_THREE], STEAM_ID64, STEAM_ID64_TWO),
+    ],
+)
+async def test_compare_refresh_cooldown_cannot_be_bypassed(
+    bot: Bot,
+    dispatcher: Dispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+    marked: list[str],
+    left: str,
+    right: str,
+) -> None:
+    now = [1000.0]
+    cooldown = RefreshCooldown(60, clock=lambda: now[0])
+    cooldown.mark(marked)
+    faceit_client = make_compare_client()
+    setup_dispatcher(
+        dispatcher,
+        faceit_client,
+        refresh_cooldown=cooldown,
+    )
+    patch_compare_dependencies(monkeypatch)
+
+    callback = CallbackQuery(
+        id="callback-1",
+        from_user=USER,
+        chat_instance="chat-instance",
+        data=f"refresh_compare:{left}:{right}",
+        message=make_message("старое сравнение", message_id=2),
+    )
+    await dispatcher.feed_update(
+        bot,
+        Update(update_id=1, callback_query=callback),
+    )
+
+    # Перестановка A/B или замена второго игрока не обходит cooldown:
+    # общий игрок уже обновлялся, сеть не используется.
+    assert faceit_client.invalidated_steam_ids == []
+    assert faceit_client.player_lookup_calls == []
+    answers = [
+        method
+        for method in bot.session.requests
+        if isinstance(method, AnswerCallbackQuery)
+    ]
+    assert len(answers) == 1
+    assert answers[0].text == "Данные уже свежие, обновлены 0 сек назад."
+
+
+@pytest.mark.asyncio
+async def test_parallel_refresh_same_player_loads_once(
+    bot: Bot,
+    dispatcher: Dispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [1000.0]
+    cooldown = RefreshCooldown(60, clock=lambda: now[0])
+    faceit_client = FakeFaceitClient()
+    setup_dispatcher(dispatcher, faceit_client, refresh_cooldown=cooldown)
+    patch_steam(
+        monkeypatch,
+        SteamStats(cs2_hours=100, vac_banned=False),
+    )
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    lookup_calls = 0
+    original_lookup = faceit_client.get_player_by_steam_id
+
+    async def blocked_lookup(steam64: str) -> dict[str, Any] | None:
+        nonlocal lookup_calls
+        lookup_calls += 1
+        started.set()
+        await release.wait()
+        return await original_lookup(steam64)
+
+    faceit_client.get_player_by_steam_id = blocked_lookup  # type: ignore[method-assign]
+
+    first = asyncio.create_task(
+        dispatcher.feed_update(
+            bot,
+            Update(
+                update_id=1,
+                callback_query=make_callback(
+                    f"refresh:{STEAM_ID64}",
+                    message_id=2,
+                ),
+            ),
+        )
+    )
+    await started.wait()
+
+    second = asyncio.create_task(
+        dispatcher.feed_update(
+            bot,
+            Update(
+                update_id=2,
+                callback_query=make_callback(
+                    f"refresh:{STEAM_ID64}",
+                    message_id=3,
+                ),
+            ),
+        )
+    )
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    # Второй refresh увидел резерв cooldown и не пошёл в загрузку.
+    assert lookup_calls == 1
+
+    release.set()
+    await asyncio.gather(first, second)
+
+    assert lookup_calls == 1
+    assert faceit_client.player_lookup_calls == [STEAM_ID64]
+    assert cooldown.status([STEAM_ID64]).blocked is True
+
+
+@pytest.mark.asyncio
+async def test_refresh_releases_cooldown_after_load_error(
+    bot: Bot,
+    dispatcher: Dispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [1000.0]
+    cooldown = RefreshCooldown(60, clock=lambda: now[0])
+    faceit_client = FakeFaceitClient(
+        player_errors={STEAM_ID64: handlers.FaceitError("faceit down")},
+    )
+    setup_dispatcher(dispatcher, faceit_client, refresh_cooldown=cooldown)
+    patch_steam(
+        monkeypatch,
+        SteamStats(cs2_hours=100, vac_banned=False),
+    )
+
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=1,
+            callback_query=make_callback(
+                f"refresh:{STEAM_ID64}",
+                message_id=2,
+            ),
+        ),
+    )
+
+    assert faceit_client.invalidated_steam_ids == [STEAM_ID64]
+    # Неудачная загрузка не должна удерживать cooldown.
+    assert cooldown.status([STEAM_ID64]).blocked is False
+    assert send_messages(bot)[-1].text == handlers.FACEIT_ERROR_MESSAGE
+
+    faceit_client.player_errors = None
+    bot.session.requests.clear()
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=2,
+            callback_query=make_callback(
+                f"refresh:{STEAM_ID64}",
+                message_id=3,
+            ),
+        ),
+    )
+
+    assert faceit_client.invalidated_steam_ids == [STEAM_ID64, STEAM_ID64]
+    assert faceit_client.player_lookup_calls == [STEAM_ID64, STEAM_ID64]
+    assert cooldown.status([STEAM_ID64]).blocked is True
+    edits = [
+        method
+        for method in bot.session.requests
+        if isinstance(method, EditMessageText)
+    ]
+    assert len(edits) == 1
+    assert "TestPlayer" in (edits[0].text or "")
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_middleware_cuts_spam_and_refresh_hits_cooldown(
+    bot: Bot,
+    dispatcher: Dispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [1000.0]
+    limiter = SlidingWindowRateLimiter(
+        limit=2,
+        window_seconds=60,
+        clock=lambda: now[0],
+    )
+    middleware = RateLimitMiddleware(limiter, heavy_weight=2)
+    dispatcher.message.outer_middleware(middleware)
+    dispatcher.callback_query.outer_middleware(middleware)
+
+    try:
+        faceit_client = FakeFaceitClient()
+        cooldown = RefreshCooldown(300, clock=lambda: now[0])
+        setup_dispatcher(
+            dispatcher,
+            faceit_client,
+            refresh_cooldown=cooldown,
+        )
+        patch_steam(
+            monkeypatch,
+            SteamStats(cs2_hours=100, vac_banned=False),
+        )
+
+        async def fake_resolve(value: str) -> str:
+            return STEAM_ID64
+
+        monkeypatch.setattr(handlers, "resolve_steam_id", fake_resolve)
+
+        for index in range(3):
+            await dispatcher.feed_update(
+                bot,
+                Update(
+                    update_id=index + 1,
+                    message=make_message(
+                        URL_ONE,
+                        message_id=index + 1,
+                    ),
+                ),
+            )
+
+        messages = send_messages(bot)
+        assert (
+            sum(
+                1
+                for message in messages
+                if "TestPlayer" in (message.text or "")
+            )
+            == 2
+        )
+        assert [
+            message.text
+            for message in messages
+            if message.text
+            == RATE_LIMITED_MESSAGE.format(seconds=60)
+        ] == [RATE_LIMITED_MESSAGE.format(seconds=60)]
+        assert faceit_client.player_lookup_calls == [STEAM_ID64, STEAM_ID64]
+        assert cooldown.status([STEAM_ID64]).blocked is True
+
+        # Окно лимитера истекло, а 300-секундный cooldown — ещё нет.
+        now[0] = 1061.0
+        bot.session.requests.clear()
+        await dispatcher.feed_update(
+            bot,
+            Update(
+                update_id=10,
+                callback_query=make_callback(
+                    f"refresh:{STEAM_ID64}",
+                    message_id=2,
+                ),
+            ),
+        )
+
+        assert faceit_client.invalidated_steam_ids == []
+        answers = [
+            method
+            for method in bot.session.requests
+            if isinstance(method, AnswerCallbackQuery)
+        ]
+        assert len(answers) == 1
+        assert answers[0].text == (
+            "Данные уже свежие, обновлены 61 сек назад."
+        )
+        assert not [
+            method
+            for method in bot.session.requests
+            if isinstance(method, EditMessageText)
+        ]
+    finally:
+        dispatcher.message.outer_middleware.unregister(middleware)
+        dispatcher.callback_query.outer_middleware.unregister(middleware)
+
+
+@pytest.mark.asyncio
+async def test_real_client_refresh_does_not_refetch_match_details(
+    bot: Bot,
+    dispatcher: Dispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        paths.append(path)
+        if path.endswith("/players"):
+            return httpx.Response(200, json=PLAYER)
+        if path.endswith("/stats/cs2"):
+            return httpx.Response(200, json=LIFETIME)
+        if path.endswith("/games/cs2/stats"):
+            return httpx.Response(200, json=RECENT)
+        if path.startswith("/data/v4/matches/"):
+            match_id = path.rsplit("/", maxsplit=1)[-1]
+            return httpx.Response(200, json=MATCH_DETAILS[match_id])
+        return httpx.Response(200, json=RANKING_REGION)
+
+    async with FaceitClient(
+        "test-api-key",
+        max_requests_per_second=100.0,
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        setup_dispatcher(dispatcher, client)
+        patch_steam(
+            monkeypatch,
+            SteamStats(cs2_hours=100, vac_banned=False),
+        )
+
+        async def fake_resolve(value: str) -> str:
+            return STEAM_ID64
+
+        monkeypatch.setattr(handlers, "resolve_steam_id", fake_resolve)
+
+        await dispatcher.feed_update(
+            bot,
+            Update(
+                update_id=1,
+                message=make_message(URL_ONE),
+            ),
+        )
+
+        first_paths = list(paths)
+        match_paths = [
+            path
+            for path in first_paths
+            if path.startswith("/data/v4/matches/")
+        ]
+        assert len(match_paths) == 2
+
+        bot.session.requests.clear()
+        await dispatcher.feed_update(
+            bot,
+            Update(
+                update_id=2,
+                callback_query=make_callback(
+                    f"refresh:{STEAM_ID64}",
+                    message_id=2,
+                ),
+            ),
+        )
+
+        refresh_paths = paths[len(first_paths):]
+        assert not [
+            path
+            for path in refresh_paths
+            if path.startswith("/data/v4/matches/")
+        ]
+        assert len(refresh_paths) == len(first_paths) - 2
+
+        edits = [
+            method
+            for method in bot.session.requests
+            if isinstance(method, EditMessageText)
+        ]
+        assert len(edits) == 1
+        assert "TestPlayer" in (edits[0].text or "")
