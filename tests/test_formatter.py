@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime
 
 from bot.formatter import (
+    COMPARE_WITH_CALLBACK_PREFIX,
+    COMPARE_WITH_TEXT,
     MAX_MESSAGE_LENGTH,
     MENU_CANCEL_CALLBACK,
     MENU_COMPARE_CALLBACK,
@@ -334,17 +336,26 @@ def test_build_player_keyboard_has_required_buttons() -> None:
         faceit_url=FACEIT_URL,
     )
 
+    steam64 = "76561198000000000"
     keyboard = build_player_keyboard(
         profile,
-        refresh_callback_data=f"refresh:{PLAYER_ID}",
+        steam64=steam64,
+        refresh_callback_data=f"refresh:{steam64}",
     )
 
+    assert len(keyboard.inline_keyboard) == 3
     profile_button = keyboard.inline_keyboard[0][0]
     refresh_button = keyboard.inline_keyboard[1][0]
+    compare_button = keyboard.inline_keyboard[2][0]
     assert profile_button.text == "Открыть профиль на Faceit"
     assert profile_button.url == FACEIT_URL
     assert refresh_button.text == "Обновить"
-    assert refresh_button.callback_data == f"refresh:{PLAYER_ID}"
+    assert refresh_button.callback_data == f"refresh:{steam64}"
+    assert compare_button.text == COMPARE_WITH_TEXT
+    assert compare_button.callback_data == (
+        f"{COMPARE_WITH_CALLBACK_PREFIX}{steam64}"
+    )
+    assert len((compare_button.callback_data or "").encode()) <= 64
 
 
 def test_limit_message_keeps_html_lines_and_length() -> None:
@@ -430,6 +441,14 @@ def test_format_player_comparison_contains_metrics_and_keyboard() -> None:
     assert (
         keyboard.inline_keyboard[1][0].callback_data
         == "refresh_compare:one:two"
+    )
+    assert len(keyboard.inline_keyboard) == 2
+    assert not any(
+        (button.callback_data or "").startswith(
+            COMPARE_WITH_CALLBACK_PREFIX
+        )
+        for row in keyboard.inline_keyboard
+        for button in row
     )
 
 

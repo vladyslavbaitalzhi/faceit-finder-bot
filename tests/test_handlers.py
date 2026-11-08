@@ -31,7 +31,10 @@ from aiogram.types import (
 from bot import handlers
 from bot.faceit import FaceitClient
 from bot.formatter import (
+    COMPARE_WITH_CALLBACK_PREFIX,
+    COMPARE_WITH_TEXT,
     MENU_CANCEL_CALLBACK,
+    MENU_CANCEL_TEXT,
     MENU_COMPARE_CALLBACK,
     MENU_COMPARE_TEXT,
     MENU_FIND_CALLBACK,
@@ -249,6 +252,7 @@ class FakeFaceitClient:
         ) = None,
         recent_by_player: dict[str, dict[str, Any] | None] | None = None,
         player_errors: dict[str, Exception] | None = None,
+        cached_nicknames: dict[str, str] | None = None,
     ) -> None:
         self.player = player
         self.lifetime = lifetime
@@ -263,11 +267,13 @@ class FakeFaceitClient:
         self.lifetime_by_player = lifetime_by_player
         self.recent_by_player = recent_by_player
         self.player_errors = player_errors
+        self.cached_nicknames = dict(cached_nicknames or {})
         self.invalidated_steam_ids: list[str] = []
         self.player_lookup_calls: list[str] = []
         self.recent_limits: list[int] = []
         self.ranking_calls: list[tuple[str, str, str | None]] = []
         self.requested_match_ids: list[str] = []
+        self.nickname_peeks: list[str] = []
 
     async def get_player_by_steam_id(
         self,
@@ -327,6 +333,10 @@ class FakeFaceitClient:
     def invalidate_player_by_steam_id(self, steam64: str) -> None:
         self.invalidated_steam_ids.append(steam64)
 
+    def peek_player_nickname(self, steam64: str) -> str | None:
+        self.nickname_peeks.append(steam64)
+        return self.cached_nicknames.get(steam64)
+
 
 def patch_steam(
     monkeypatch: pytest.MonkeyPatch,
@@ -353,12 +363,14 @@ def make_compare_client(
     ) = None,
     recent_by_player: dict[str, dict[str, Any] | None] | None = None,
     player_errors: dict[str, Exception] | None = None,
+    cached_nicknames: dict[str, str] | None = None,
 ) -> FakeFaceitClient:
     return FakeFaceitClient(
         players_by_steam=players_by_steam,
         lifetime_by_player=lifetime_by_player,
         recent_by_player=recent_by_player,
         player_errors=player_errors,
+        cached_nicknames=cached_nicknames,
     )
 
 
@@ -420,6 +432,15 @@ async def get_fsm_state(dispatcher: Dispatcher, bot: Bot) -> str | None:
     """Возвращает текущее состояние FSM."""
     context = FSMContext(dispatcher.storage, fsm_key(bot))
     return await context.get_state()
+
+
+async def get_fsm_data(
+    dispatcher: Dispatcher,
+    bot: Bot,
+) -> dict[str, Any]:
+    """Возвращает данные текущего состояния FSM."""
+    context = FSMContext(dispatcher.storage, fsm_key(bot))
+    return await context.get_data()
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -536,6 +557,10 @@ async def test_handle_link_sends_stats_and_keyboard(
     )
     assert keyboard[1][0].text == "Обновить"
     assert keyboard[1][0].callback_data == f"refresh:{STEAM_ID64}"
+    assert keyboard[2][0].text == COMPARE_WITH_TEXT
+    assert keyboard[2][0].callback_data == (
+        f"{COMPARE_WITH_CALLBACK_PREFIX}{STEAM_ID64}"
+    )
 
 
 @pytest.mark.asyncio
@@ -703,6 +728,485 @@ async def test_refresh_callback_invalidates_player_cache_and_edits_message(
         edits[0].reply_markup.inline_keyboard[1][0].callback_data
         == f"refresh:{STEAM_ID64}"
     )
+    # Кнопка быстрого сравнения остаётся и после refresh.
+    assert edits[0].reply_markup.inline_keyboard[2][0].text == (
+        COMPARE_WITH_TEXT
+    )
+    assert (
+        edits[0].reply_markup.inline_keyboard[2][0].callback_data
+        == f"{COMPARE_WITH_CALLBACK_PREFIX}{STEAM_ID64}"
+    )
+
+@pytest.mark.asyncio
+async def test_compare_with_callback_starts_waiting_second(
+    bot: Bot,
+    dispatcher: Dispatcher,
+) -> None:
+    faceit_client = FakeFaceitClient(
+        cached_nicknames={STEAM_ID64: "TestPlayer"},
+    )
+    setup_dispatcher(dispatcher, faceit_client)
+
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=1,
+            callback_query=make_callback(
+                f"{COMPARE_WITH_CALLBACK_PREFIX}{STEAM_ID64}",
+            ),
+        ),
+    )
+
+    assert await get_fsm_state(dispatcher, bot) == (
+        handlers.CompareFlow.waiting_second.state
+    )
+    assert (await get_fsm_data(dispatcher, bot))[
+        handlers.COMPARE_LEFT_STEAM64_KEY
+    ] == STEAM_ID64
+
+    messages = send_messages(bot)
+    assert len(messages) == 1
+    assert messages[0].text == handlers.COMPARE_WITH_PROMPT_MESSAGE.format(
+        nickname="TestPlayer",
+    )
+    assert messages[0].reply_markup is not None
+    assert (
+        messages[0].reply_markup.inline_keyboard[0][0].callback_data
+        == MENU_CANCEL_CALLBACK
+    )
+    assert faceit_client.player_lookup_calls == []
+    assert faceit_client.nickname_peeks == [STEAM_ID64]
+
+
+@pytest.mark.asyncio
+async def test_compare_with_callback_without_cached_nickname(
+    bot: Bot,
+    dispatcher: Dispatcher,
+) -> None:
+    faceit_client = FakeFaceitClient()
+    setup_dispatcher(dispatcher, faceit_client)
+
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=1,
+            callback_query=make_callback(
+                f"{COMPARE_WITH_CALLBACK_PREFIX}{STEAM_ID64}",
+            ),
+        ),
+    )
+
+    assert await get_fsm_state(dispatcher, bot) == (
+        handlers.CompareFlow.waiting_second.state
+    )
+    messages = send_messages(bot)
+    assert len(messages) == 1
+    assert (
+        messages[0].text
+        == handlers.COMPARE_WITH_PROMPT_NO_NICKNAME_MESSAGE
+    )
+    assert faceit_client.nickname_peeks == [STEAM_ID64]
+
+
+@pytest.mark.asyncio
+async def test_compare_with_callback_without_faceit_client(
+    bot: Bot,
+    dispatcher: Dispatcher,
+) -> None:
+    setup_dispatcher(dispatcher, None)
+    context = FSMContext(dispatcher.storage, fsm_key(bot))
+    await context.set_state(handlers.CompareFlow.waiting_first)
+
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=1,
+            callback_query=make_callback(
+                f"{COMPARE_WITH_CALLBACK_PREFIX}{STEAM_ID64}",
+            ),
+        ),
+    )
+
+    assert await get_fsm_state(dispatcher, bot) == (
+        handlers.CompareFlow.waiting_first.state
+    )
+    assert send_messages(bot) == []
+    answers = [
+        method
+        for method in bot.session.requests
+        if isinstance(method, AnswerCallbackQuery)
+    ]
+    assert len(answers) == 1
+    assert answers[0].text == handlers.FACEIT_NOT_CONFIGURED_MESSAGE
+    assert answers[0].show_alert is True
+
+
+@pytest.mark.asyncio
+async def test_compare_with_callback_rejects_invalid_steam64(
+    bot: Bot,
+    dispatcher: Dispatcher,
+) -> None:
+    faceit_client = FakeFaceitClient()
+    setup_dispatcher(dispatcher, faceit_client)
+    context = FSMContext(dispatcher.storage, fsm_key(bot))
+    await context.set_state(handlers.CompareFlow.waiting_first)
+
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=1,
+            callback_query=make_callback("compare_with:not-a-steam-id"),
+        ),
+    )
+
+    assert await get_fsm_state(dispatcher, bot) == (
+        handlers.CompareFlow.waiting_first.state
+    )
+    assert send_messages(bot) == []
+    answers = [
+        method
+        for method in bot.session.requests
+        if isinstance(method, AnswerCallbackQuery)
+    ]
+    assert len(answers) == 1
+    assert answers[0].text == "Некорректные данные для сравнения."
+    assert answers[0].show_alert is True
+    assert faceit_client.nickname_peeks == []
+
+
+@pytest.mark.asyncio
+async def test_compare_with_callback_rejects_stale_message(
+    bot: Bot,
+    dispatcher: Dispatcher,
+) -> None:
+    setup_dispatcher(dispatcher, FakeFaceitClient())
+    callback = CallbackQuery(
+        id="callback-1",
+        from_user=USER,
+        chat_instance="chat-instance",
+        data=f"{COMPARE_WITH_CALLBACK_PREFIX}{STEAM_ID64}",
+        message=None,
+    )
+
+    await dispatcher.feed_update(
+        bot,
+        Update(update_id=1, callback_query=callback),
+    )
+
+    assert await get_fsm_state(dispatcher, bot) is None
+    assert send_messages(bot) == []
+    answers = [
+        method
+        for method in bot.session.requests
+        if isinstance(method, AnswerCallbackQuery)
+    ]
+    assert len(answers) == 1
+    assert answers[0].text == (
+        "Сообщение устарело. Пришли ссылку на Steam-профиль ещё раз."
+    )
+    assert answers[0].show_alert is True
+
+
+@pytest.mark.asyncio
+async def test_compare_with_repeated_click_does_not_duplicate_message(
+    bot: Bot,
+    dispatcher: Dispatcher,
+) -> None:
+    faceit_client = FakeFaceitClient(
+        cached_nicknames={STEAM_ID64: "TestPlayer"},
+    )
+    setup_dispatcher(dispatcher, faceit_client)
+    callback_data = f"{COMPARE_WITH_CALLBACK_PREFIX}{STEAM_ID64}"
+
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=1,
+            callback_query=make_callback(callback_data),
+        ),
+    )
+    bot.session.requests.clear()
+
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=2,
+            callback_query=make_callback(callback_data, message_id=3),
+        ),
+    )
+
+    assert send_messages(bot) == []
+    answers = [
+        method
+        for method in bot.session.requests
+        if isinstance(method, AnswerCallbackQuery)
+    ]
+    assert len(answers) == 1
+    assert answers[0].text == handlers.COMPARE_WITH_ALREADY_WAITING_MESSAGE
+    assert await get_fsm_state(dispatcher, bot) == (
+        handlers.CompareFlow.waiting_second.state
+    )
+    assert faceit_client.nickname_peeks == [STEAM_ID64]
+
+
+@pytest.mark.asyncio
+async def test_compare_with_overwrites_waiting_first_state(
+    bot: Bot,
+    dispatcher: Dispatcher,
+) -> None:
+    faceit_client = FakeFaceitClient(
+        cached_nicknames={STEAM_ID64: "TestPlayer"},
+    )
+    setup_dispatcher(dispatcher, faceit_client)
+
+    await dispatcher.feed_update(
+        bot,
+        Update(update_id=1, message=make_message(MENU_COMPARE_TEXT)),
+    )
+    assert await get_fsm_state(dispatcher, bot) == (
+        handlers.CompareFlow.waiting_first.state
+    )
+    bot.session.requests.clear()
+
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=2,
+            callback_query=make_callback(
+                f"{COMPARE_WITH_CALLBACK_PREFIX}{STEAM_ID64}",
+            ),
+        ),
+    )
+
+    assert await get_fsm_state(dispatcher, bot) == (
+        handlers.CompareFlow.waiting_second.state
+    )
+    assert (await get_fsm_data(dispatcher, bot))[
+        handlers.COMPARE_LEFT_STEAM64_KEY
+    ] == STEAM_ID64
+    messages = send_messages(bot)
+    assert len(messages) == 1
+    assert "TestPlayer" in (messages[0].text or "")
+
+
+@pytest.mark.asyncio
+async def test_compare_with_callback_makes_no_http_with_cached_nickname(
+    bot: Bot,
+    dispatcher: Dispatcher,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=PLAYER)
+
+    async with FaceitClient(
+        "test-api-key",
+        max_requests_per_second=100.0,
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        setup_dispatcher(dispatcher, client)
+        await client.get_player_by_steam_id(STEAM_ID64)
+        requests.clear()
+
+        await dispatcher.feed_update(
+            bot,
+            Update(
+                update_id=1,
+                callback_query=make_callback(
+                    f"{COMPARE_WITH_CALLBACK_PREFIX}{STEAM_ID64}",
+                ),
+            ),
+        )
+
+        assert requests == []
+        messages = send_messages(bot)
+        assert len(messages) == 1
+        assert "TestPlayer" in (messages[0].text or "")
+
+
+@pytest.mark.asyncio
+async def test_compare_with_callback_makes_no_http_without_cache(
+    bot: Bot,
+    dispatcher: Dispatcher,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=PLAYER)
+
+    async with FaceitClient(
+        "test-api-key",
+        max_requests_per_second=100.0,
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        setup_dispatcher(dispatcher, client)
+
+        await dispatcher.feed_update(
+            bot,
+            Update(
+                update_id=1,
+                callback_query=make_callback(
+                    f"{COMPARE_WITH_CALLBACK_PREFIX}{STEAM_ID64}",
+                ),
+            ),
+        )
+
+        assert requests == []
+        messages = send_messages(bot)
+        assert len(messages) == 1
+        assert (
+            messages[0].text
+            == handlers.COMPARE_WITH_PROMPT_NO_NICKNAME_MESSAGE
+        )
+
+
+@pytest.mark.asyncio
+async def test_profile_compare_with_button_flow(
+    bot: Bot,
+    dispatcher: Dispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    faceit_client = make_compare_client(
+        players_by_steam={
+            STEAM_ID64: PLAYER,
+            STEAM_ID64_TWO: PLAYER_TWO,
+        },
+        lifetime_by_player={
+            PLAYER_ID: LIFETIME,
+            PLAYER_TWO_ID: LIFETIME_TWO,
+        },
+        recent_by_player={
+            PLAYER_ID: RECENT,
+            PLAYER_TWO_ID: RECENT_TWO,
+        },
+        cached_nicknames={STEAM_ID64: "TestPlayer"},
+    )
+    setup_dispatcher(dispatcher, faceit_client)
+    patch_compare_dependencies(
+        monkeypatch,
+        steam_by_steam={
+            STEAM_ID64: SteamStats(cs2_hours=100, vac_banned=False),
+            STEAM_ID64_TWO: SteamStats(cs2_hours=200, vac_banned=False),
+        },
+    )
+
+    await dispatcher.feed_update(
+        bot,
+        Update(update_id=1, message=make_message(URL_ONE)),
+    )
+
+    profile_message = send_messages(bot)[0]
+    assert profile_message.reply_markup is not None
+    compare_button = profile_message.reply_markup.inline_keyboard[2][0]
+    assert compare_button.text == COMPARE_WITH_TEXT
+    assert compare_button.callback_data == (
+        f"{COMPARE_WITH_CALLBACK_PREFIX}{STEAM_ID64}"
+    )
+
+    lookups_before = len(faceit_client.player_lookup_calls)
+    bot.session.requests.clear()
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=2,
+            callback_query=make_callback(
+                compare_button.callback_data or "",
+            ),
+        ),
+    )
+
+    prompt = send_messages(bot)[0]
+    assert "Первый игрок: <b>TestPlayer</b>" in (prompt.text or "")
+    assert await get_fsm_state(dispatcher, bot) == (
+        handlers.CompareFlow.waiting_second.state
+    )
+    assert len(faceit_client.player_lookup_calls) == lookups_before
+
+    bot.session.requests.clear()
+    await dispatcher.feed_update(
+        bot,
+        Update(update_id=3, message=make_message(URL_TWO)),
+    )
+
+    comparison = send_messages(bot)
+    assert len(comparison) == 1
+    assert "TestPlayer" in (comparison[0].text or "")
+    assert "RivalPlayer" in (comparison[0].text or "")
+    assert comparison[0].reply_markup is not None
+    assert (
+        comparison[0].reply_markup.inline_keyboard[1][0].callback_data
+        == f"refresh_compare:{STEAM_ID64}:{STEAM_ID64_TWO}"
+    )
+    assert await get_fsm_state(dispatcher, bot) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cancel_text",
+    [MENU_CANCEL_TEXT, "/cancel", "/start"],
+)
+async def test_compare_with_state_can_be_cancelled(
+    bot: Bot,
+    dispatcher: Dispatcher,
+    cancel_text: str,
+) -> None:
+    setup_dispatcher(dispatcher, FakeFaceitClient())
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=1,
+            callback_query=make_callback(
+                f"{COMPARE_WITH_CALLBACK_PREFIX}{STEAM_ID64}",
+            ),
+        ),
+    )
+    assert await get_fsm_state(dispatcher, bot) == (
+        handlers.CompareFlow.waiting_second.state
+    )
+    bot.session.requests.clear()
+
+    await dispatcher.feed_update(
+        bot,
+        Update(update_id=2, message=make_message(cancel_text)),
+    )
+
+    assert await get_fsm_state(dispatcher, bot) is None
+    assert send_messages(bot)
+
+
+@pytest.mark.asyncio
+async def test_compare_with_same_player_shows_error(
+    bot: Bot,
+    dispatcher: Dispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_dispatcher(
+        dispatcher,
+        FakeFaceitClient(cached_nicknames={STEAM_ID64: "TestPlayer"}),
+    )
+    patch_compare_dependencies(monkeypatch)
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=1,
+            callback_query=make_callback(
+                f"{COMPARE_WITH_CALLBACK_PREFIX}{STEAM_ID64}",
+            ),
+        ),
+    )
+    bot.session.requests.clear()
+
+    await dispatcher.feed_update(
+        bot,
+        Update(update_id=2, message=make_message(URL_ONE)),
+    )
+
+    messages = send_messages(bot)
+    assert len(messages) == 1
+    assert messages[0].text == handlers.COMPARE_SAME_PLAYER_MESSAGE
+
 
 @pytest.mark.asyncio
 async def test_handle_compare_command_sends_comparison(

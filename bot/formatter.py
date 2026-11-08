@@ -40,6 +40,9 @@ MENU_HELP_CALLBACK = "menu:help"
 MENU_CANCEL_CALLBACK = "menu:cancel"
 MENU_MAIN_CALLBACK = "menu:main"
 
+COMPARE_WITH_TEXT = "⚔️ Сравнить с другим игроком"
+COMPARE_WITH_CALLBACK_PREFIX = "compare_with:"
+
 
 def _truncate(value: str, max_length: int) -> str:
     """Обрезает строку, добавляя многоточие при необходимости."""
@@ -688,9 +691,10 @@ def build_comparison_keyboard(
 def build_player_keyboard(
     profile: PlayerProfile,
     *,
+    steam64: str,
     refresh_callback_data: str,
 ) -> InlineKeyboardMarkup:
-    """Создаёт inline-клавиатуру профиля и обновления статистики."""
+    """Создаёт inline-клавиатуру профиля, обновления и сравнения."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -703,6 +707,12 @@ def build_player_keyboard(
                 InlineKeyboardButton(
                     text="Обновить",
                     callback_data=refresh_callback_data,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=COMPARE_WITH_TEXT,
+                    callback_data=f"{COMPARE_WITH_CALLBACK_PREFIX}{steam64}",
                 )
             ],
         ]

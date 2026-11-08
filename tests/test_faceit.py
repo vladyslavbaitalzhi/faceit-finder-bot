@@ -575,6 +575,61 @@ def test_ttl_cache_evicts_least_recently_used_when_full() -> None:
     assert len(cache) == 2
 
 
+def test_ttl_cache_peek_does_not_change_lru_order() -> None:
+    now = [0.0]
+    cache = _TTLCache[str, int](
+        ttl=10,
+        max_entries=2,
+        clock=lambda: now[0],
+    )
+
+    cache.set("first", 1)
+    cache.set("second", 2)
+    assert cache.peek("first") == 1
+
+    # peek не должен делать first «свежим»: вытесняется именно first.
+    cache.set("third", 3)
+    assert cache.get("first") is None
+    assert cache.get("second") == 2
+    assert cache.get("third") == 3
+
+
+def test_ttl_cache_peek_ignores_expired_entries() -> None:
+    now = [0.0]
+    cache = _TTLCache[str, int](
+        ttl=10,
+        clock=lambda: now[0],
+    )
+
+    cache.set("key", 42)
+    now[0] = 10.0
+
+    assert cache.peek("key") is None
+
+
+@pytest.mark.asyncio
+async def test_peek_player_nickname_uses_cache_without_http() -> None:
+    captured: list[httpx.Request] = []
+    transport = httpx.MockTransport(
+        make_handler(
+            response=httpx.Response(200, json=PLAYER_PAYLOAD),
+            captured=captured,
+        )
+    )
+
+    async with FaceitClient("test-api-key", transport=transport) as client:
+        assert client.peek_player_nickname(STEAM_ID64) is None
+        assert captured == []
+
+        await client.get_player_by_steam_id(STEAM_ID64)
+        assert client.peek_player_nickname(STEAM_ID64) == "TestPlayer"
+        assert len(captured) == 1
+
+        client.invalidate_player_by_steam_id(STEAM_ID64)
+        assert client.peek_player_nickname(STEAM_ID64) is None
+        assert len(captured) == 1
+
+
 def test_ttl_cache_purges_expired_entries_before_eviction() -> None:
     now = [0.0]
     cache = _TTLCache[str, int](

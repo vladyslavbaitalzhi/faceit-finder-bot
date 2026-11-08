@@ -15,6 +15,7 @@ from aiogram.types import CallbackQuery, Message, TelegramObject
 
 from bot.formatter import (
     CANCEL_TEXTS,
+    COMPARE_WITH_CALLBACK_PREFIX,
     MENU_CANCEL_CALLBACK,
     MENU_CANCEL_TEXT,
     MENU_COMPARE_CALLBACK,
@@ -48,6 +49,7 @@ EXEMPT_MENU_CALLBACKS = {
     MENU_MAIN_CALLBACK,
 }
 REFRESH_CALLBACK_PREFIXES = ("refresh:", "refresh_compare:")
+EXEMPT_CALLBACK_PREFIXES = (COMPARE_WITH_CALLBACK_PREFIX,)
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,6 +320,9 @@ class RateLimitMiddleware(BaseMiddleware):
 
     def _callback_cost(self, callback_data: str) -> int:
         if callback_data in EXEMPT_MENU_CALLBACKS:
+            return 0
+        # Быстрый старт сравнения из профиля не делает сетевых запросов.
+        if callback_data.startswith(EXEMPT_CALLBACK_PREFIXES):
             return 0
         if callback_data.startswith(REFRESH_CALLBACK_PREFIXES):
             return self._heavy_weight

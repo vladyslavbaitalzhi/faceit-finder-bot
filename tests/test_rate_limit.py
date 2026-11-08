@@ -11,7 +11,11 @@ from aiogram.client.session.base import BaseSession
 from aiogram.methods import AnswerCallbackQuery, SendMessage, TelegramMethod
 from aiogram.types import CallbackQuery, Chat, Message, User
 
-from bot.formatter import MENU_CANCEL_TEXT, MENU_FIND_CALLBACK
+from bot.formatter import (
+    COMPARE_WITH_CALLBACK_PREFIX,
+    MENU_CANCEL_TEXT,
+    MENU_FIND_CALLBACK,
+)
 from bot.rate_limit import (
     RATE_LIMITED_MESSAGE,
     RateLimitMiddleware,
@@ -272,6 +276,38 @@ async def test_middleware_cancel_texts_do_not_spend_limit(bot: Bot) -> None:
     # Отмена не израсходовала лимит: обычное действие ещё проходит,
     # а следующее за ним — уже нет.
     assert len(limiter) == 0
+    assert len(
+        await run_middleware(
+            middleware,
+            make_message(URL_ONE, bot=bot, message_id=10),
+        )
+    ) == 1
+    assert (
+        await run_middleware(
+            middleware,
+            make_message(URL_ONE, bot=bot, message_id=11),
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_compare_with_callback_does_not_spend_limit(bot: Bot) -> None:
+    limiter = SlidingWindowRateLimiter(
+        limit=1,
+        window_seconds=60,
+        clock=lambda: 0.0,
+    )
+    middleware = RateLimitMiddleware(limiter, heavy_weight=2)
+    callback = make_callback(
+        f"{COMPARE_WITH_CALLBACK_PREFIX}76561198000000000",
+        bot=bot,
+    )
+
+    assert len(await run_middleware(middleware, callback)) == 1
+    assert len(limiter) == 0
+
+    # После бесплатного callback обычный поиск ещё проходит, а следующий — нет.
     assert len(
         await run_middleware(
             middleware,

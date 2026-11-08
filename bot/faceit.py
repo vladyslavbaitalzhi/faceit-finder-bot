@@ -250,6 +250,17 @@ class _TTLCache(Generic[CacheKey, CacheValue]):
         self._items.move_to_end(key)
         return value
 
+    def peek(self, key: CacheKey) -> CacheValue | None:
+        """Возвращает живое значение без запроса и изменения LRU-порядка."""
+        item = self._items.get(key)
+        if item is None:
+            return None
+
+        expires_at, value = item
+        if self._clock() >= expires_at:
+            return None
+        return value
+
     def set(
         self,
         key: CacheKey,
@@ -748,6 +759,23 @@ class FaceitClient:
 
         self._remember_player(steam64, player.player_id)
         return player.model_dump()
+
+    def peek_player_nickname(self, steam64: str) -> str | None:
+        """Возвращает ник из кэша профиля, не выполняя HTTP-запрос.
+
+        Используется для подсказки при быстром сравнении. Кэш читается
+        без изменения LRU-порядка, поэтому подсказка не влияет на вытеснение.
+
+        Args:
+            steam64: SteamID64 игрока.
+
+        Returns:
+            Ник из закэшированного профиля либо ``None``.
+        """
+        cached = self._cache.peek(("player_by_steam_id", steam64))
+        if not isinstance(cached, FaceitPlayer):
+            return None
+        return cached.nickname or None
 
     async def get_lifetime_stats(
         self,

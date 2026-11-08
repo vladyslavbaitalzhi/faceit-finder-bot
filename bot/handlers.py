@@ -19,6 +19,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from bot.faceit import FaceitClient, FaceitError, FaceitNotFound, FaceitRateLimit
 from bot.formatter import (
     CANCEL_TEXTS,
+    COMPARE_WITH_CALLBACK_PREFIX,
     MENU_CANCEL_CALLBACK,
     MENU_COMPARE_CALLBACK,
     MENU_COMPARE_TEXT,
@@ -119,6 +120,17 @@ COMPARE_SECOND_PROMPT_MESSAGE = (
     "Первый игрок: <b>{nickname}</b>\n"
     "Шаг 2 из 2. Теперь отправь ссылку на <b>второго</b> игрока."
 )
+
+COMPARE_WITH_PROMPT_MESSAGE = (
+    "Первый игрок: <b>{nickname}</b>. "
+    "Пришли ссылку на Steam-профиль второго игрока."
+)
+
+COMPARE_WITH_PROMPT_NO_NICKNAME_MESSAGE = (
+    "Пришли ссылку на Steam-профиль второго игрока."
+)
+
+COMPARE_WITH_ALREADY_WAITING_MESSAGE = "Уже жду ссылку на второго игрока."
 
 CANCELLED_MESSAGE = (
     "<b>Действие отменено.</b>\n\n"
@@ -868,6 +880,7 @@ def _build_message(
         format_player_stats(stats),
         build_player_keyboard(
             stats.profile,
+            steam64=steam64,
             refresh_callback_data=f"{REFRESH_CALLBACK_PREFIX}{steam64}",
         ),
     )
@@ -1212,6 +1225,64 @@ async def handle_menu_main(
             START_MESSAGE,
             reply_markup=build_start_keyboard(),
         )
+
+
+@router.callback_query(F.data.startswith(COMPARE_WITH_CALLBACK_PREFIX))
+async def handle_compare_with(
+    query: CallbackQuery,
+    state: FSMContext,
+    faceit_client: FaceitClient | None = None,
+) -> None:
+    """Запускает сравнение с игроком из открытого профиля."""
+    if faceit_client is None:
+        await query.answer(
+            FACEIT_NOT_CONFIGURED_MESSAGE,
+            show_alert=True,
+        )
+        return
+
+    steam64 = (query.data or "").removeprefix(COMPARE_WITH_CALLBACK_PREFIX)
+    if not STEAM_ID64_RE.fullmatch(steam64):
+        await query.answer(
+            "Некорректные данные для сравнения.",
+            show_alert=True,
+        )
+        return
+
+    if not isinstance(query.message, Message):
+        await query.answer(
+            "Сообщение устарело. Пришли ссылку на Steam-профиль ещё раз.",
+            show_alert=True,
+        )
+        return
+
+    current_state = await state.get_state()
+    data = await state.get_data()
+    if (
+        current_state == CompareFlow.waiting_second.state
+        and data.get(COMPARE_LEFT_STEAM64_KEY) == steam64
+    ):
+        await query.answer(COMPARE_WITH_ALREADY_WAITING_MESSAGE)
+        return
+
+    await state.set_state(CompareFlow.waiting_second)
+    await state.update_data(**{COMPARE_LEFT_STEAM64_KEY: steam64})
+    await query.answer()
+
+    nickname = faceit_client.peek_player_nickname(steam64)
+    if nickname:
+        prompt = COMPARE_WITH_PROMPT_MESSAGE.format(
+            nickname=escape_html(nickname),
+        )
+    else:
+        prompt = COMPARE_WITH_PROMPT_NO_NICKNAME_MESSAGE
+
+    await query.message.answer(
+        prompt,
+        reply_markup=build_cancel_keyboard(),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
 
 
 @router.callback_query(F.data.startswith(REFRESH_CALLBACK_PREFIX))
